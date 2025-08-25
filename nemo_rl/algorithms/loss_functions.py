@@ -22,7 +22,10 @@ from nemo_rl.algorithms.utils import (
     masked_mean,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import from_parallel_logits_to_logprobs
+from nemo_rl.distributed.model_utils import (
+    from_parallel_logits_to_logprobs,
+    gather_logits_at_global_indices,
+)
 from nemo_rl.models.dtensor.parallelize import (
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -777,6 +780,9 @@ class DistillationLossConfig(TypedDict):
     temperature: float
     alpha: float
     beta: float
+    kl_type: str
+    mixed_kl_weight: float
+    topk_logits_k: int
 
 
 class DistillationLossDataDict(TypedDict):
@@ -784,7 +790,9 @@ class DistillationLossDataDict(TypedDict):
     input_lengths: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
-    teacher_logprobs: NotRequired[torch.Tensor]
+    teacher_topk_logits: NotRequired[torch.Tensor]
+    teacher_topk_indices: NotRequired[torch.Tensor]
+    tau: NotRequired[float]
 
 
 class DistillationLossFn(LossFunction):
@@ -796,6 +804,7 @@ class DistillationLossFn(LossFunction):
         self.alpha = config.get("alpha", 0.5)
         self.kl_type = config.get("kl_type", "forward")  
         self.mixed_kl_weight = config.get("mixed_kl_weight", 0.5)
+        self.loss_type = LossType.TOKEN_LEVEL
     def __call__(
         self,
         next_token_logits: torch.Tensor,
@@ -806,69 +815,127 @@ class DistillationLossFn(LossFunction):
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute distillation loss between teacher and student logits."""
-    
-        input_ids = data.get("input_ids")
-        expected_batch_size = input_ids.shape[0]
-        expected_seq_len = input_ids.shape[1]
+        """Compute distillation loss between teacher and student logits.
 
-        student_logits = next_token_logits
-        teacher_logprobs = None
-        
-        teacher_logprobs = data["teacher_logprobs"]
+        Notes:
+        - Aligns token positions with next-token prediction: uses logits[:, :-1] vs input_ids[:, 1:].
+        - Handles DTensor/TP the same way as NLLLoss to avoid mixing DTensor with torch.Tensor in gather.
+        """
 
-        '''
-        temperature = getattr(self, 'temperature', 1.0)
-        if temperature != 1.0:
-            student_logits = student_logits / temperature
-        '''
+        # Basic shapes
+        input_ids = data["input_ids"]
+        batch_size = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
 
-        student_logprobs = torch.log_softmax(student_logits, dim=-1)
-        # Gather logprobs at the actual token positions
-        target_tokens = data["input_ids"]  # Shape: (batch_size, sequence_length)
+        # Ensure float32 for stability (match other losses)
+        next_token_logits = next_token_logits.to(torch.float32)
 
-        student_logprobs = student_logprobs.gather(dim=-1, index=target_tokens.unsqueeze(-1)).squeeze(-1)
+        per_token_kl = None
+        # Preferred truncated-KL path: teacher provides top-k support per position
+        teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
+        teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
 
-        kl_type = getattr(self, 'kl_type', "forward")  
-        # according to kl_type, compute different KL divergence
-        if kl_type == "forward":
-            # KL(teacher || student)
-            kl_loss = (torch.exp(teacher_logprobs)*(teacher_logprobs - student_logprobs)).sum(-1)
-        elif kl_type == "reverse":
-            # KL(student || teacher)
-            kl_loss = (torch.exp(student_logprobs)*(student_logprobs - teacher_logprobs)).sum(-1)
-        elif kl_type == "mixed":
-            # mixed KL
-            kl_forward = (torch.exp(teacher_logprobs)*(teacher_logprobs - student_logprobs)).sum(-1)
-            kl_reverse = (torch.exp(student_logprobs)*(student_logprobs - teacher_logprobs)).sum(-1)
-            mixed_weight = getattr(self, 'mixed_kl_weight', 0.5)
-            kl_loss = mixed_weight * kl_forward + (1.0 - mixed_weight) * kl_reverse
+        teacher_topk_logits = teacher_topk_logits[:, :-1, :]
+        teacher_topk_indices = teacher_topk_indices[:, :-1, :]
+
+        student_logits_trimmed = next_token_logits[:, :-1, :]
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+            )
+            V_local = int(student_logits_trimmed.shape[-1])
+            vocab_start_index = vocab_parallel_rank * V_local
+            vocab_end_index = (vocab_parallel_rank + 1) * V_local
+            student_topk_logits = gather_logits_at_global_indices(
+                student_logits_trimmed,
+                teacher_topk_indices,
+                tp_group=vocab_parallel_group,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+            )
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            # DTensor path: use local shard with TP group/rank for distributed gather
+            device_mesh = next_token_logits.device_mesh
+            tp_group = device_mesh.get_group("tp")
+            tp_rank = tp_group.rank()
+            local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
+            local_student_logits = local_student_logits[:, :-1, :]
+            V_local = int(local_student_logits.shape[-1])
+            vocab_start_index = tp_rank * V_local
+            vocab_end_index = (tp_rank + 1) * V_local
+            # Ensure indices are on same device
+            teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
+            student_topk_logits = gather_logits_at_global_indices(
+                local_student_logits,
+                teacher_topk_indices,
+                tp_group=tp_group,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+            )
         else:
-            # forward KL by default
-            kl_loss = torch.exp(teacher_logprobs - student_logprobs).sum(-1)
+            student_topk_logits = student_logits_trimmed.gather(
+                dim=-1, index=teacher_topk_indices.to(student_logits_trimmed.device)
+            )
+
+        tau = float(data.get("tau", self.temperature))
+        # Move teacher tensors to the same device/dtype as student_topk_logits
+        teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
+        teacher_log_probs = torch.nn.functional.log_softmax(
+            teacher_topk_logits / float(tau), dim=-1
+        )  # [B, S-1, k]
+        teacher_probs = teacher_log_probs.exp() # [B, S-1, k]
+
+        student_log_probs = torch.nn.functional.log_softmax(student_topk_logits, dim=-1) # [B, S-1, k]
+        student_probs = student_log_probs.exp() # [B, S-1, k]
+
+        kl_type = getattr(self, "kl_type", "forward")
+        if kl_type == "forward":
+            per_token_kl = teacher_probs * (
+                teacher_log_probs - student_log_probs
+            )
+        elif kl_type == "reverse":
+            per_token_kl = student_probs * (
+                student_log_probs - teacher_log_probs
+            )
+        elif kl_type == "mixed":
+            kl_forward = teacher_probs * (
+                teacher_log_probs - student_log_probs
+            )
+            kl_reverse = student_probs * (
+                student_log_probs - teacher_log_probs
+            )
+            mixed_weight = getattr(self, "mixed_kl_weight", 0.5)
+            per_token_kl = mixed_weight * kl_forward + (1.0 - mixed_weight) * kl_reverse
+        else:
+            raise ValueError(f"Invalid KL type: {kl_type}")
         
-        # apply mask
-        if "token_mask" in data:
-            token_mask = data["token_mask"]
+        per_token_kl = per_token_kl.sum(dim=-1) # [B, S-1]
+
+        # Masking and reduction
+        if "token_mask" in data and "sample_mask" in data:
+            token_mask = data["token_mask"][:, 1:]
             sample_mask = data["sample_mask"]
-            if len(token_mask.shape) == 2 and token_mask.shape[1] == expected_seq_len:
-                # Combine token_mask and sample_mask: mask = token_mask * sample_mask.unsqueeze(-1)
-                mask = token_mask * sample_mask.unsqueeze(-1)
-                kl_loss = kl_loss * mask
-        
-        kl_loss = torch.mean(kl_loss)
-        
-        alpha = getattr(self, 'alpha', 1.0)
+            # Align mask length to current per_token_kl
+            max_len = per_token_kl.shape[1]
+            token_mask = token_mask[:, :max_len]
+            mask = token_mask * sample_mask.unsqueeze(-1) # [B, S-1]
+            # align mask shape to per_token_kl
+            kl_loss = masked_mean(
+                per_token_kl,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+        else:
+            kl_loss = per_token_kl.mean()
+
+        alpha = getattr(self, "alpha", 1.0)
         total_loss = alpha * kl_loss
-        
+
         metrics = {
-            "loss": kl_loss.item(),
+            "loss": float(total_loss.item()) if total_loss.ndim == 0 else total_loss,
             "alpha": alpha,
             "kl_type_numeric": 1.0 if kl_type == "forward" else (2.0 if kl_type == "reverse" else 3.0),
-            "num_valid_samples": expected_batch_size,
-            "avg_sequence_length": expected_seq_len,
-            "total_tokens": expected_batch_size * expected_seq_len,
-            "kl_loss_per_token": kl_loss.item() / (expected_batch_size * expected_seq_len),
+            "num_valid_samples": int(batch_size),
         }
-        
+
         return total_loss, metrics
