@@ -54,6 +54,7 @@ from nemo_rl.models.dtensor.parallelize import (
     get_grad_norm,
     to_local_if_dtensor,
 )
+from nemo_rl.distributed.model_utils import distributed_vocab_topk
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -1175,6 +1176,118 @@ class DTensorPolicyWorker:
 
         return return_data
 
+    @wrap_with_nvtx_name("dtensor_policy_worker/get_topk_logits")
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Return per-position top-k logits and global indices (no CP/packed support).
+
+        Notes:
+        - Operates on logits[:, :-1, :] so that positions align with next-token targets.
+        - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
+        - Otherwise, computes local top-k on full-vocab tensor.
+        """
+        assert not self.enable_seq_packing, "get_topk_logits: sequence packing is not supported in this method"
+        assert self.cp_size == 1, "get_topk_logits: context parallel is not supported in this method"
+
+        batch_size_total = data.get("input_ids").shape[0]
+        seq_dim_size = data.get("input_ids").shape[1]
+
+        # dynamic batching support (no CP/packed)
+        use_dynamic = self.cfg["dynamic_batching"]["enabled"]
+        if use_dynamic:
+            mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+            iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+        else:
+            topk_batch_size = (
+                micro_batch_size if micro_batch_size is not None else self.cfg["logprob_batch_size"]
+            )
+            mb_iterator = data.make_microbatch_iterator(topk_batch_size)
+            iterator_len = data.size // topk_batch_size
+
+        self.model.eval()
+        out_topk_vals = []
+        out_topk_idx = []
+
+        with unshard_fsdp2_model(self.model), torch.no_grad():
+            data.to("cuda")
+
+            for batch_idx, lp_batch in enumerate(mb_iterator):
+                input_ids = lp_batch.get("input_ids").cuda()
+                input_lengths = lp_batch.get("input_lengths")
+
+                batch_size, seq_len = input_ids.shape
+
+                # Build attention mask (right-padded inputs)
+                attention_mask = torch.zeros(
+                    (batch_size, seq_len), dtype=torch.long, device=input_ids.device
+                )
+                for i, length in enumerate(input_lengths):
+                    attention_mask[i, : length] = 1
+
+                position_ids = torch.arange(seq_len, device=input_ids.device).repeat(batch_size, 1)
+
+                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        use_cache=False,
+                    )
+
+                logits = outputs.logits  # [B, S, V] or DTensor sharded on V
+                # IMPORTANT: do not apply generation temperature scaling here for teacher top-k
+
+                # Compute top-k over full sequence length (do not drop last position)
+                if isinstance(logits, DTensor):
+                    local_logits = logits.to_local()  # [B, S, V_local]
+                    tp_group = self.tp_mesh.get_group()
+                    tp_rank = torch.distributed.get_rank(tp_group)
+                    V_local = int(local_logits.shape[-1])
+                    vocab_start_index = tp_rank * V_local
+                    vocab_end_index = (tp_rank + 1) * V_local
+
+                    vals, idx = distributed_vocab_topk(
+                        local_logits[:, :, :],
+                        k=k,
+                        tp_group=tp_group,
+                        vocab_start_index=vocab_start_index,
+                        vocab_end_index=vocab_end_index,
+                    )
+                else:
+                    full_logits = logits.to(torch.float32)
+                    vals, idx = torch.topk(full_logits[:, :, :], k=k, dim=-1)
+
+                # Keep only real sequence tokens (mask padded positions)
+                # We keep shapes [B, S-1, k]; caller can handle masking downstream if needed.
+                out_topk_vals.append(vals.cpu())
+                out_topk_idx.append(idx.cpu())
+
+        ret = BatchedDataDict[Any]()
+        # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
+        all_topk_vals_padded = []
+        all_topk_idx_padded = []
+        target_seq_len = seq_dim_size
+        for vals, idx in zip(out_topk_vals, out_topk_idx):
+            pad_needed = target_seq_len - vals.shape[1]
+            if pad_needed > 0:
+                # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
+                vals = torch.nn.functional.pad(vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0)
+                idx = torch.nn.functional.pad(idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0)
+            all_topk_vals_padded.append(vals)
+            all_topk_idx_padded.append(idx)
+
+        ret["topk_logits"] = (
+            torch.cat(all_topk_vals_padded, dim=0) if len(all_topk_vals_padded) > 1 else all_topk_vals_padded[0]
+        ).cpu()
+        ret["topk_indices"] = (
+            torch.cat(all_topk_idx_padded, dim=0) if len(all_topk_idx_padded) > 1 else all_topk_idx_padded[0]
+        ).cpu()
+        return ret
+
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
         """Context manager that temporarily swaps the reference model and active model.
@@ -1515,3 +1628,4 @@ class DTensorPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
