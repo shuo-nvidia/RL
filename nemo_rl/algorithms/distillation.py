@@ -10,6 +10,7 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
+# limitations under the License.
 import os
 import warnings
 from pathlib import Path
@@ -73,6 +74,7 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     max_rollout_turns: int # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     topk_logits_k: int
+    seed: int
 
 class DistillationSaveState(TypedDict):
     step: int
@@ -141,7 +143,7 @@ def setup(
     )
 
     # Set random seed
-    set_seed(42)  
+    set_seed(distillation_config["seed"])
 
     # ==========================
     #         Logger

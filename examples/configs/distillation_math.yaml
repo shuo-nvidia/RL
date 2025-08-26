@@ -1,15 +1,15 @@
-# GRPO Algorithm Configuration
-
+# Distillation Algorithm Configuration
 distillation:
     num_prompts_per_step: 256
     num_generations_per_prompt: 1
+    max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     max_num_steps: 1000
     val_batch_size: 512
     val_period: 5
     val_at_start: false
     max_val_samples: 1024
-    max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     topk_logits_k: 64
+    seed: 42
 
 loss_fn:
     temperature: 1.0
@@ -24,11 +24,11 @@ checkpointing:
     metric_name: "val_reward"
     higher_is_better: true
     keep_top_k: 3
-    save_period: 5
+    save_period: 10
     checkpoint_must_save_by: null
 
 policy: &POLICY_BASE
-    model_name: "Qwen/Qwen3-1.7B-Base"
+    model_name: "Qwen/Qwen3-1.7B"
     tokenizer:
         name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
     train_global_batch_size: 256
