@@ -1,5 +1,5 @@
 policy: &POLICY_BASE
-    model_name: "Qwen/Qwen3-8B-Base"
+    model_name: "Qwen/Qwen3-1.7B-Base"
     tokenizer:
         name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
     train_global_batch_size: 256
@@ -91,7 +91,7 @@ policy: &POLICY_BASE
 teacher:
     <<: *POLICY_BASE
     # 按需覆盖差异项示例：
-    model_name: "Qwen/Qwen3-32B"
+    model_name: "Qwen/Qwen3-4B"
     dtensor_cfg:
         <<: *DTENSOR_BASE
         tensor_parallel_size: 4
@@ -107,19 +107,19 @@ loss_fn:
 
 # distillation algorithm config
 distillation:
-    teacher_model_path: "Qwen/Qwen3-32B"
+    #teacher_model_path: "Qwen/Qwen3-32B"
 
     # distillation policy parameters
-    generate_strategy: # student generation parameters
-        max_length: ${policy.max_total_sequence_length} # refer to policy config
-        max_new_tokens: 128 # limit the number of generated tokens, avoid sequence too long (this value should be less than max_total_sequence_length)
-        temperature: 1.0 # sampling temperature (control the randomness of generation, default is 1.0)
-        decoding_method: "top_p" # decoding method (e.g. greedy, top_k)
+    #generate_strategy: # student generation parameters
+    #    max_length: ${policy.max_total_sequence_length} # refer to policy config
+    #    max_new_tokens: 128 # limit the number of generated tokens, avoid sequence too long (this value should be less than max_total_sequence_length)
+    #    temperature: 1.0 # sampling temperature (control the randomness of generation, default is 1.0)
+    #    decoding_method: "top_p" # decoding method (e.g. greedy, top_k)
 
     max_num_steps: 1000
-    eval_steps: 10
-    save_steps: 500
-    logging_steps: 10
+    #eval_steps: 10
+    #save_steps: 500
+    #logging_steps: 10
     num_prompts_per_step: 256
     num_generations_per_prompt: 1
     val_batch_size: 512
@@ -142,7 +142,7 @@ data:
 
 cluster:
     gpus_per_node: 8
-    num_nodes: 2
+    num_nodes: 1
 
 env_vars:
     PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
