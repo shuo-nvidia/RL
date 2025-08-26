@@ -57,7 +57,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import run_multi_turn_rollout, run_async_multi_turn_rollout
 from nemo_rl.algorithms.grpo import _should_use_async_rollouts
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
-
+from nemo_rl.algorithms.grpo import refit_policy_generation
 # ===============================================================================
 # Configuration
 # ===============================================================================
@@ -362,7 +362,7 @@ def setup(
 # Core Algorithm Functions
 # ===============================================================================
 
-def refit_student_generation(
+def refit_policy_generation(
     student_policy: ColocatablePolicyInterface,
     student_generation: GenerationInterface,
     colocated_inference: bool,
@@ -481,7 +481,7 @@ def distillation_train(
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_student_generation(student_policy, student_generation, colocated_inference)
+            refit_policy_generation(student_policy, student_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
         else:
             student_generation.prepare_for_generation()
@@ -530,7 +530,7 @@ def distillation_train(
                 print(f"▶ Generating responses for batch of size {repeated_batch.size}...")
                 with timer.time("prepare_for_generation"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_student_generation(
+                        refit_policy_generation(
                             student_policy, student_generation, colocated_inference, timer=timer
                         )
                         POLICY_GENERATION_STALE = False
@@ -639,7 +639,7 @@ def distillation_train(
                 # Run validation if it's a validation step
                 if val_period > 0 and (step + 1) % val_period == 0:
                     if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_student_generation(
+                        refit_policy_generation(
                             student_policy, student_generation, colocated_inference
                         )
                         POLICY_GENERATION_STALE = False
