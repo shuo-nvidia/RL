@@ -831,7 +831,6 @@ class DistillationLossConfig(TypedDict):
     alpha: float
     kl_type: str
     mixed_kl_weight: float
-    topk_logits_k: int
 
 
 class DistillationLossDataDict(TypedDict):
@@ -847,12 +846,11 @@ class DistillationLossDataDict(TypedDict):
 class DistillationLossFn(LossFunction):
     """Distillation loss function"""
     
-    def __init__(self, config: DistillationLossConfig):
-        self.config = config
-        self.temperature = config.get("temperature", 1.0)
-        self.alpha = config.get("alpha", 0.5)
-        self.kl_type = config.get("kl_type", "forward")  
-        self.mixed_kl_weight = config.get("mixed_kl_weight", 0.5)
+    def __init__(self, cfg: DistillationLossConfig):
+        self.temperature = cfg.get("temperature", 1.0)
+        self.alpha = cfg.get("alpha", 0.5)
+        self.kl_type = cfg.get("kl_type", "forward")  
+        self.mixed_kl_weight = cfg.get("mixed_kl_weight", 0.5)
         self.loss_type = LossType.TOKEN_LEVEL
     def __call__(
         self,
@@ -874,7 +872,6 @@ class DistillationLossFn(LossFunction):
         # Basic shapes
         input_ids = data["input_ids"]
         batch_size = input_ids.shape[0]
-        seq_len = input_ids.shape[1]
 
         # Ensure float32 for stability (match other losses)
         next_token_logits = next_token_logits.to(torch.float32)

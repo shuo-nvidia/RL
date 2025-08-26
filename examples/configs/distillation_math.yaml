@@ -16,7 +16,6 @@ loss_fn:
     alpha: 1.0
     kl_type: "forward" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
-    topk_logits_k: 64
 
 checkpointing:
     enabled: true
