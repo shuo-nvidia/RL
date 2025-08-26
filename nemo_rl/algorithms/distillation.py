@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and limitations.
 import os
 import warnings
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
-import ray
 import torch
 import numpy as np
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -65,14 +63,16 @@ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
 class DistillationConfig(TypedDict):
-    teacher_model_path: str           # Teacher model path (for loading weights)
-    generate_strategy: dict[str, Any] # Generation strategy parameters
-    
     # Training configuration
+    num_prompts_per_step: int
+    num_generations_per_prompt: int
     max_num_steps: int
-    eval_steps: int
-    save_steps: int
-    logging_steps: int
+    val_batch_size: int
+    val_period: 5
+    val_at_start: bool
+    max_val_samples: int
+    max_rollout_turns: int # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+    topk_logits_k: int
 
 
 class MasterConfig(TypedDict):
@@ -359,81 +359,6 @@ def setup(
 
 
 # ===============================================================================
-# Core Algorithm Functions
-# ===============================================================================
-'''
-# use this if we should not import the refit_policy_generation function from grpo.py
-def refit_policy_generation(
-    student_policy: ColocatablePolicyInterface,
-    student_generation: GenerationInterface,
-    colocated_inference: bool,
-    _refit_buffer_size_gb: Optional[int] = None,
-    timer: Optional[Timer] = None,
-    generation_config: Optional[dict] = None,
-    master_config: Optional[dict] = None,
-) -> None:
-    """Refit the student generation interface with the latest policy weights.
-    
-    Args:
-        student_policy: The student policy model
-        student_generation: The student generation interface
-        colocated_inference: Whether to use colocated inference
-        _refit_buffer_size_gb: Buffer size in GB
-        timer: Timer for performance measurement
-        generation_config: Generation configuration dictionary
-        master_config: Master configuration dictionary for parameters like max_total_sequence_length
-    """
-    if colocated_inference:
-        student_policy.offload_before_refit()
-        student_generation.prepare_for_generation(tags=["weights"])
-        
-
-    # Create a context manager that does nothing when timer is None
-    timer_context = (
-        timer.time("prepare_for_generation/transfer_and_update_weights")
-        if timer is not None
-        else nullcontext()
-    )
-    with timer_context:
-        # Update weights
-        update_success = False
-        if colocated_inference:
-            # Get model parameter keys, grouped by size
-            grouped_param_keys = student_policy.prepare_weights_for_ipc(
-                _refit_buffer_size_gb=_refit_buffer_size_gb
-            )
-            
-            # Execute updates
-            for keys in grouped_param_keys:
-                ipc_handles = student_policy.get_weights_ipc_handles(keys)
-                update_success = student_generation.update_weights_from_ipc_handles(ipc_handles)
-                if not update_success:
-                    break
-        else:
-            # Update weights through NCCL
-            futures_train = student_policy.broadcast_weights_for_collective()
-            futures_inference = student_generation.update_weights_from_collective()
-            # Wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-
-        # Check if update was successful
-        if not update_success:
-            error_tag = "cuda-ipc" if colocated_inference else "nccl"
-            error_message = (
-                "❌ Error: Updating weights for the student generation policy failed during refit.\n"
-                f"This often indicates an issue with {error_tag} or "
-                "a problem within the generation backend (e.g., vLLM worker).\n"
-            )
-            raise RuntimeError(error_message)
-
-    if colocated_inference:
-        student_policy.offload_after_refit()
-        student_generation.prepare_for_generation(tags=["kv_cache"])
-'''
-
-# ===============================================================================
 # Training & Validation
 # ===============================================================================
 
@@ -632,9 +557,6 @@ def distillation_train(
                 with timer.time("policy_training"):
                     train_results = student_policy.train(train_data, loss_fn)
 
-                # is_last_step = step + 1 == min(
-                #     master_config["distillation"]["max_num_steps"], len(dataloader)
-                # )
                 is_last_step = step + 1 == master_config["distillation"]["max_num_steps"] 
 
                 # Run validation if it's a validation step
