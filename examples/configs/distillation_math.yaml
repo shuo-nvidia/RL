@@ -6,7 +6,7 @@ distillation:
     max_num_steps: 1000
     val_batch_size: 512
     val_period: 5
-    val_at_start: false
+    val_at_start: true
     max_val_samples: 1024
     topk_logits_k: 64
     seed: 42
@@ -37,6 +37,7 @@ policy: &POLICY_BASE
     logprob_batch_size: 2
     max_total_sequence_length: 16384
     precision: "bfloat16"
+    logprob_chunk_size: null
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
@@ -77,7 +78,7 @@ policy: &POLICY_BASE
             foreach: False
             fused: False
 
-    megatron_cfg:
+    megatron_cfg: # [TODO]
         enabled: false
 
     scheduler:
@@ -100,29 +101,32 @@ policy: &POLICY_BASE
         top_k: null
         stop_token_ids: null
         stop_strings: null
-
         vllm_cfg:
+            async_engine: false
+            precision: ${...precision}
             tensor_parallel_size: 1
+            pipeline_parallel_size: 1
             gpu_memory_utilization: 0.6
             max_model_len: ${...max_total_sequence_length} # refer to local policy/teacher config
-            async_engine: false
-            pipeline_parallel_size: 1
-            precision: ${...precision}
             enforce_eager: False
-
+            use_deep_gemm: False
+            num_last_layers_in_bf16: 0
+            num_first_layers_in_bf16: 0
             distributed_executor_backend: null
 
         colocated:
+            # true: generation shares training GPUs
+            # false: uses dedicated generation resources
             enabled: true
-
+            # only relevant when enabled is false
             resources:
-                gpus_per_node: null
-                num_nodes: null
+                gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
+                num_nodes: null # Decides number of nodes to be dedicated to generation
+
 
 teacher:
     <<: *POLICY_BASE
-    # 按需覆盖差异项示例：
-    model_name: "Qwen/Qwen3-14B"
+    model_name: "Qwen/Qwen3-8B"
     dtensor_cfg:
         <<: *DTENSOR_BASE
         tensor_parallel_size: 4

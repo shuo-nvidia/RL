@@ -779,7 +779,6 @@ class SequencePackingLossWrapper:
 class DistillationLossConfig(TypedDict):
     temperature: float
     alpha: float
-    beta: float
     kl_type: str
     mixed_kl_weight: float
     topk_logits_k: int
