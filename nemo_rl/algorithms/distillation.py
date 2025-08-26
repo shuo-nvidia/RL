@@ -68,7 +68,7 @@ class DistillationConfig(TypedDict):
     num_generations_per_prompt: int
     max_num_steps: int
     val_batch_size: int
-    val_period: 5
+    val_period: int
     val_at_start: bool
     max_val_samples: int
     max_rollout_turns: int # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
@@ -85,7 +85,7 @@ def _default_distillation_save_state() -> DistillationSaveState:
         "step": 0,
         "consumed_samples": 0,
     }
-    
+
 class MasterConfig(TypedDict):
     """Main configuration structure"""
     policy: PolicyConfig             # Student model configuration
