@@ -74,7 +74,18 @@ class DistillationConfig(TypedDict):
     max_rollout_turns: int # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     topk_logits_k: int
 
+class DistillationSaveState(TypedDict):
+    step: int
+    val_reward: NotRequired[float]
+    consumed_samples: int
 
+
+def _default_distillation_save_state() -> DistillationSaveState:
+    return {
+        "step": 0,
+        "consumed_samples": 0,
+    }
+    
 class MasterConfig(TypedDict):
     """Main configuration structure"""
     policy: PolicyConfig             # Student model configuration
@@ -86,21 +97,6 @@ class MasterConfig(TypedDict):
     logger: LoggerConfig                # Logger configuration
     cluster: ClusterConfig              # Cluster configuration
     checkpointing: CheckpointingConfig  # Checkpointing configuration
-
-
-class DistillationSaveState(TypedDict):
-    step: int
-    val_reward: NotRequired[float]
-    consumed_samples: int
-    # epoch: int
-
-
-def _default_distillation_save_state() -> DistillationSaveState:
-    return {
-        "step": 0,
-        "consumed_samples": 0,
-        # "epoch": 0,
-    }
 
 
 # ===============================================================================
