@@ -260,7 +260,7 @@ def main() -> None:
         student_generation,
         dataloader,
         val_dataloader,
-        tokenizer,  # add tokenizer
+        #tokenizer,  # add tokenizer
         loss_fn,
         logger,
         checkpointer,
