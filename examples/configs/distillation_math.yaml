@@ -108,7 +108,7 @@ loss_fn:
 # distillation algorithm config
 distillation:
     #teacher_model_path: "Qwen/Qwen3-32B"
-
+    # the following parameters are not used in script, but we keep them here for reference
     # distillation policy parameters
     #generate_strategy: # student generation parameters
     #    max_length: ${policy.max_total_sequence_length} # refer to policy config
@@ -117,9 +117,6 @@ distillation:
     #    decoding_method: "top_p" # decoding method (e.g. greedy, top_k)
 
     max_num_steps: 1000
-    #eval_steps: 10
-    #save_steps: 500
-    #logging_steps: 10
     num_prompts_per_step: 256
     num_generations_per_prompt: 1
     val_batch_size: 512

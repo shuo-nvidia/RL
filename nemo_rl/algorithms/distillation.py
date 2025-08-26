@@ -361,7 +361,8 @@ def setup(
 # ===============================================================================
 # Core Algorithm Functions
 # ===============================================================================
-
+'''
+# use this if we should not import the refit_policy_generation function from grpo.py
 def refit_policy_generation(
     student_policy: ColocatablePolicyInterface,
     student_generation: GenerationInterface,
@@ -430,7 +431,7 @@ def refit_policy_generation(
     if colocated_inference:
         student_policy.offload_after_refit()
         student_generation.prepare_for_generation(tags=["kv_cache"])
-
+'''
 
 # ===============================================================================
 # Training & Validation
