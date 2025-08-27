@@ -515,11 +515,13 @@ def distillation_train(
                                 message["token_loss_mask"] = torch.zeros_like(
                                     message["token_ids"]
                                 )
+                            # TODO: we may use this to sample top k from student model's logits
+                            '''
                             if "generation_logprobs" not in message:
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
-
+                            '''
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -536,6 +538,7 @@ def distillation_train(
                             "input_lengths": input_lengths,
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
+                            # "generation_logprobs": flat_messages["generation_logprobs"], [TODO] we may use this to sample top k from student model's logits
                         }
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
