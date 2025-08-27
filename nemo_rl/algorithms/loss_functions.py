@@ -962,7 +962,10 @@ class DistillationLossFn(LossFunction):
 
         tau = float(data.get("tau", self.temperature))
         # Move teacher tensors to the same device/dtype as student_topk_logits
-        teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
+        if self.zero_outside_topk:
+            teacher_topk_logits = teacher_topk_logits.to(student_topk_logprobs.device, dtype=student_topk_logprobs.dtype)
+        else:
+            teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
         teacher_log_probs = torch.nn.functional.log_softmax(
             teacher_topk_logits / float(tau), dim=-1
         )  # [B, S-1, k]
