@@ -6,7 +6,7 @@ distillation:
     max_num_steps: 1000
     val_batch_size: 512
     val_period: 5
-    val_at_start: true
+    val_at_start: false
     max_val_samples: 1024
     topk_logits_k: 64
     seed: 42
