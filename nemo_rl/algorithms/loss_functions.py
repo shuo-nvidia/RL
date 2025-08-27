@@ -923,7 +923,7 @@ class DistillationLossFn(LossFunction):
         else:
             if self.zero_outside_topk:
                 student_logprobs = torch.nn.functional.log_softmax(student_logits_trimmed, dim=-1)
-                student_topk_logprobs = student_logits_trimmed.gather(
+                student_topk_logprobs = student_logprobs.gather(
                 dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
             )
             else:
