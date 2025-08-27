@@ -143,7 +143,13 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
-
+    assert (
+        not loss_config.get("zero_outside_topk", False) 
+        or policy_config["dtensor_cfg"]["tensor_parallel_size"] == 1
+    ), (
+        f"zero_outside_topk=True requires tensor_parallel_size=1, "
+        f"but got tensor_parallel_size={policy_config['dtensor_cfg']['tensor_parallel_size']}. "
+    )
     # Set random seed
     set_seed(distillation_config["seed"])
 

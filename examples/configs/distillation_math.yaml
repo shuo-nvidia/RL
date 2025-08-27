@@ -16,7 +16,7 @@ loss_fn:
     alpha: 1.0
     kl_type: "forward" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
-    zero_outside_topk: true # if true, zero out the teacher logits outside the top k when calculate forward KL loss
+    zero_outside_topk: true # if true, tp should be 1: zero out the teacher logits outside the top k when calculate forward KL loss
 
 checkpointing:
     enabled: true
@@ -44,7 +44,7 @@ policy: &POLICY_BASE
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
-        tensor_parallel_size: 4
+        tensor_parallel_size: 1
         context_parallel_size: 1
         custom_parallel_plan: null
 

@@ -893,62 +893,33 @@ class DistillationLossFn(LossFunction):
             V_local = int(student_logits_trimmed.shape[-1])
             vocab_start_index = vocab_parallel_rank * V_local
             vocab_end_index = (vocab_parallel_rank + 1) * V_local
-            if self.zero_outside_topk:
-                student_logprobs = torch.nn.functional.log_softmax(student_logits_trimmed, dim=-1)
-                student_topk_logprobs=gather_logits_at_global_indices(
-                    student_logprobs,
-                    teacher_topk_indices,
-                    tp_group=vocab_parallel_group,
-                    vocab_start_index=vocab_start_index,
-                    vocab_end_index=vocab_end_index,
-                )
-            
-            else:
-                student_topk_logits = gather_logits_at_global_indices(
-                    student_logits_trimmed,
-                    teacher_topk_indices,
-                    tp_group=vocab_parallel_group,
-                    vocab_start_index=vocab_start_index,
-                    vocab_end_index=vocab_end_index,
-                )
+            student_topk_logits = gather_logits_at_global_indices(
+                student_logits_trimmed,
+                teacher_topk_indices,
+                tp_group=vocab_parallel_group,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+            )
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             # DTensor path: use local shard with TP group/rank for distributed gather
             device_mesh = next_token_logits.device_mesh
             tp_group = device_mesh.get_group("tp")
             tp_rank = tp_group.rank()
-            if self.zero_outside_topk:
-                student_logprobs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
-                local_student_logprobs = student_logprobs.to_local()
-                local_student_logprobs = local_student_logprobs[:, :-1, :]
-                V_local = int(local_student_logprobs.shape[-1])
-                vocab_start_index = tp_rank * V_local
-                vocab_end_index = (tp_rank + 1) * V_local
-                # Ensure indices are on same device
-                teacher_topk_indices = teacher_topk_indices.to(local_student_logprobs.device)
-            else:
-                local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
-                local_student_logits = local_student_logits[:, :-1, :]
-                V_local = int(local_student_logits.shape[-1])
-                vocab_start_index = tp_rank * V_local
-                vocab_end_index = (tp_rank + 1) * V_local
-                # Ensure indices are on same device
-                teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
-            if self.zero_outside_topk:
-                student_topk_logprobs=gather_logits_at_global_indices(
-                    local_student_logprobs,
-                    teacher_topk_indices,
-                    tp_group=tp_group,
-                    vocab_start_index=vocab_start_index,
-                    vocab_end_index=vocab_end_index,
-                )
-            else:
-                student_topk_logits = gather_logits_at_global_indices(
-                    local_student_logits,
-                    teacher_topk_indices,
-                    tp_group=tp_group,
-                    vocab_start_index=vocab_start_index,
-                    vocab_end_index=vocab_end_index,
-                )
+
+            local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
+            local_student_logits = local_student_logits[:, :-1, :]
+            V_local = int(local_student_logits.shape[-1])
+            vocab_start_index = tp_rank * V_local
+            vocab_end_index = (tp_rank + 1) * V_local
+            # Ensure indices are on same device
+            teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
+            student_topk_logits = gather_logits_at_global_indices(
+                local_student_logits,
+                teacher_topk_indices,
+                tp_group=tp_group,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index,
+            )
         else:
             if self.zero_outside_topk:
                 student_logprobs = torch.nn.functional.log_softmax(student_logits_trimmed, dim=-1)
