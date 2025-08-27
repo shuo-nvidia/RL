@@ -831,7 +831,7 @@ class DistillationLossConfig(TypedDict):
     alpha: float
     kl_type: str
     mixed_kl_weight: float
-
+    zero_outside_topk: bool
 
 class DistillationLossDataDict(TypedDict):
     input_ids: torch.Tensor
@@ -851,6 +851,7 @@ class DistillationLossFn(LossFunction):
         self.alpha = cfg.get("alpha", 0.5)
         self.kl_type = cfg.get("kl_type", "forward")  
         self.mixed_kl_weight = cfg.get("mixed_kl_weight", 0.5)
+        self.zero_outside_topk=cfg.get("zero_outside_topk", False)
         self.loss_type = LossType.TOKEN_LEVEL
     def __call__(
         self,
@@ -892,36 +893,72 @@ class DistillationLossFn(LossFunction):
             V_local = int(student_logits_trimmed.shape[-1])
             vocab_start_index = vocab_parallel_rank * V_local
             vocab_end_index = (vocab_parallel_rank + 1) * V_local
-            student_topk_logits = gather_logits_at_global_indices(
-                student_logits_trimmed,
-                teacher_topk_indices,
-                tp_group=vocab_parallel_group,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_end_index,
-            )
+            if self.zero_outside_topk:
+                student_logprobs = torch.nn.functional.log_softmax(student_logits_trimmed, dim=-1)
+                student_topk_logprobs=gather_logits_at_global_indices(
+                    student_logprobs,
+                    teacher_topk_indices,
+                    tp_group=vocab_parallel_group,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_end_index,
+                )
+            
+            else:
+                student_topk_logits = gather_logits_at_global_indices(
+                    student_logits_trimmed,
+                    teacher_topk_indices,
+                    tp_group=vocab_parallel_group,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_end_index,
+                )
         elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
             # DTensor path: use local shard with TP group/rank for distributed gather
             device_mesh = next_token_logits.device_mesh
             tp_group = device_mesh.get_group("tp")
             tp_rank = tp_group.rank()
-            local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
-            local_student_logits = local_student_logits[:, :-1, :]
-            V_local = int(local_student_logits.shape[-1])
-            vocab_start_index = tp_rank * V_local
-            vocab_end_index = (tp_rank + 1) * V_local
-            # Ensure indices are on same device
-            teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
-            student_topk_logits = gather_logits_at_global_indices(
-                local_student_logits,
-                teacher_topk_indices,
-                tp_group=tp_group,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_end_index,
-            )
+            if self.zero_outside_topk:
+                student_logprobs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
+                local_student_logprobs = student_logprobs.to_local()
+                local_student_logprobs = local_student_logprobs[:, :-1, :]
+                V_local = int(local_student_logprobs.shape[-1])
+                vocab_start_index = tp_rank * V_local
+                vocab_end_index = (tp_rank + 1) * V_local
+                # Ensure indices are on same device
+                teacher_topk_indices = teacher_topk_indices.to(local_student_logprobs.device)
+            else:
+                local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
+                local_student_logits = local_student_logits[:, :-1, :]
+                V_local = int(local_student_logits.shape[-1])
+                vocab_start_index = tp_rank * V_local
+                vocab_end_index = (tp_rank + 1) * V_local
+                # Ensure indices are on same device
+                teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
+            if self.zero_outside_topk:
+                student_topk_logprobs=gather_logits_at_global_indices(
+                    local_student_logprobs,
+                    teacher_topk_indices,
+                    tp_group=tp_group,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_end_index,
+                )
+            else:
+                student_topk_logits = gather_logits_at_global_indices(
+                    local_student_logits,
+                    teacher_topk_indices,
+                    tp_group=tp_group,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_end_index,
+                )
         else:
-            student_topk_logits = student_logits_trimmed.gather(
-                dim=-1, index=teacher_topk_indices.to(student_logits_trimmed.device)
+            if self.zero_outside_topk:
+                student_logprobs = torch.nn.functional.log_softmax(student_logits_trimmed, dim=-1)
+                student_topk_logprobs = student_logits_trimmed.gather(
+                dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
             )
+            else:
+                student_topk_logits = student_logits_trimmed.gather(
+                    dim=-1, index=teacher_topk_indices.to(student_logits_trimmed.device)
+                )
 
         tau = float(data.get("tau", self.temperature))
         # Move teacher tensors to the same device/dtype as student_topk_logits
@@ -930,8 +967,11 @@ class DistillationLossFn(LossFunction):
             teacher_topk_logits / float(tau), dim=-1
         )  # [B, S-1, k]
         teacher_probs = teacher_log_probs.exp() # [B, S-1, k]
-
-        student_log_probs = torch.nn.functional.log_softmax(student_topk_logits, dim=-1) # [B, S-1, k]
+        if self.zero_outside_topk:
+            student_log_probs = student_topk_logprobs
+        else:
+            student_log_probs = torch.nn.functional.log_softmax(student_topk_logits, dim=-1) # [B, S-1, k]
+        
         student_probs = student_log_probs.exp() # [B, S-1, k]
 
         kl_type = getattr(self, "kl_type", "forward")
