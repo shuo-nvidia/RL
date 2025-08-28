@@ -779,11 +779,9 @@ class SequencePackingLossWrapper:
 class DistillationLossConfig(TypedDict):
     temperature: float
     alpha: float
-    beta: float
     kl_type: str
     mixed_kl_weight: float
-    topk_logits_k: int
-
+    zero_outside_topk: bool
 
 class DistillationLossDataDict(TypedDict):
     input_ids: torch.Tensor
@@ -798,12 +796,12 @@ class DistillationLossDataDict(TypedDict):
 class DistillationLossFn(LossFunction):
     """Distillation loss function"""
     
-    def __init__(self, config: DistillationLossConfig):
-        self.config = config
-        self.temperature = config.get("temperature", 1.0)
-        self.alpha = config.get("alpha", 0.5)
-        self.kl_type = config.get("kl_type", "forward")  
-        self.mixed_kl_weight = config.get("mixed_kl_weight", 0.5)
+    def __init__(self, cfg: DistillationLossConfig):
+        self.temperature = cfg.get("temperature", 1.0)
+        self.alpha = cfg.get("alpha", 0.5)
+        self.kl_type = cfg.get("kl_type", "forward")  
+        self.mixed_kl_weight = cfg.get("mixed_kl_weight", 0.5)
+        self.zero_outside_topk=cfg.get("zero_outside_topk", False)
         self.loss_type = LossType.TOKEN_LEVEL
     def __call__(
         self,
@@ -825,7 +823,6 @@ class DistillationLossFn(LossFunction):
         # Basic shapes
         input_ids = data["input_ids"]
         batch_size = input_ids.shape[0]
-        seq_len = input_ids.shape[1]
 
         # Ensure float32 for stability (match other losses)
         next_token_logits = next_token_logits.to(torch.float32)
@@ -858,6 +855,7 @@ class DistillationLossFn(LossFunction):
             device_mesh = next_token_logits.device_mesh
             tp_group = device_mesh.get_group("tp")
             tp_rank = tp_group.rank()
+
             local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
             local_student_logits = local_student_logits[:, :-1, :]
             V_local = int(local_student_logits.shape[-1])
@@ -873,19 +871,31 @@ class DistillationLossFn(LossFunction):
                 vocab_end_index=vocab_end_index,
             )
         else:
-            student_topk_logits = student_logits_trimmed.gather(
-                dim=-1, index=teacher_topk_indices.to(student_logits_trimmed.device)
+            if self.zero_outside_topk:
+                student_logprobs = torch.nn.functional.log_softmax(student_logits_trimmed, dim=-1)
+                student_topk_logprobs = student_logprobs.gather(
+                dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
             )
+            else:
+                student_topk_logits = student_logits_trimmed.gather(
+                    dim=-1, index=teacher_topk_indices.to(student_logits_trimmed.device)
+                )
 
         tau = float(data.get("tau", self.temperature))
         # Move teacher tensors to the same device/dtype as student_topk_logits
-        teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
+        if self.zero_outside_topk:
+            teacher_topk_logits = teacher_topk_logits.to(student_topk_logprobs.device, dtype=student_topk_logprobs.dtype)
+        else:
+            teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
         teacher_log_probs = torch.nn.functional.log_softmax(
             teacher_topk_logits / float(tau), dim=-1
         )  # [B, S-1, k]
         teacher_probs = teacher_log_probs.exp() # [B, S-1, k]
-
-        student_log_probs = torch.nn.functional.log_softmax(student_topk_logits, dim=-1) # [B, S-1, k]
+        if self.zero_outside_topk:
+            student_log_probs = student_topk_logprobs
+        else:
+            student_log_probs = torch.nn.functional.log_softmax(student_topk_logits, dim=-1) # [B, S-1, k]
+        
         student_probs = student_log_probs.exp() # [B, S-1, k]
 
         kl_type = getattr(self, "kl_type", "forward")
