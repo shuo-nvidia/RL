@@ -461,13 +461,15 @@ def distillation_train(
                     repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(
                         master_config["distillation"]["num_generations_per_prompt"]
                     )
+        
+                    ''' # not used in distillation
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
-                    #input_ids = batched_flat["token_ids"] # not used in distillation
-
+                    input_ids = batched_flat["token_ids"] 
+                    '''
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(f"▶ Generating responses for batch of size {repeated_batch.size}...")
                 with timer.time("prepare_for_generation"):
@@ -797,7 +799,7 @@ def validate(
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
-            to_env = [
+            to_env = [  
                 get_keys_from_message_log(
                     val_batch["message_log"][i], ["role", "content"]
                 )
