@@ -879,7 +879,7 @@ class DistillationLossFn(LossFunction):
                 dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
             )
                 if kl_type != "forward":
-                    H_all=student_logprobs.exp()*student_logprobs.sum(-1)
+                    H_all = student_logprobs.exp() * student_logprobs.sum(-1)
                     # The entropy of the student probs [B, S-1]
             else:
                 student_topk_logits = student_logits_trimmed.gather(
@@ -904,9 +904,9 @@ class DistillationLossFn(LossFunction):
         
         student_probs = student_log_probs.exp() # [B, S-1, k]
         if self.zero_outside_topk and kl_type != "forward":
-            H_rest=H_all-student_topk_logprobs.exp()*student_topk_logprobs.sum(-1)
-            P_rest=1-(student_probs.sum(-1))
-            # The entropy and probof the rest of the tokens [B, S-1]
+            H_rest = H_all - (student_topk_logprobs.exp() * student_topk_logprobs).sum(-1)
+            P_rest = 1 - (student_probs.sum(-1))
+            # The entropy and prob of the rest of the tokens [B, S-1]
         
         if kl_type == "forward":
             per_token_kl = teacher_probs * (
@@ -914,7 +914,7 @@ class DistillationLossFn(LossFunction):
             )
         elif kl_type == "reverse":
             per_token_kl = student_probs * (
-                    student_log_probs - teacher_log_probs
+                student_log_probs - teacher_log_probs
             )
         elif kl_type == "mixed":
             kl_forward = teacher_probs * (
@@ -934,9 +934,9 @@ class DistillationLossFn(LossFunction):
             if kl_type == "forward":
                 pass
             elif kl_type == "reverse":
-                per_token_kl=per_token_kl+H_rest-log_infinitesimal*P_rest            
+                per_token_kl = per_token_kl + H_rest - log_infinitesimal * P_rest            
             elif kl_type == "mixed":
-                per_token_kl=per_token_kl+mixed_weight*(H_rest-log_infinitesimal*P_rest)            
+                per_token_kl = per_token_kl + mixed_weight * (H_rest - log_infinitesimal * P_rest)            
             else:
                 raise ValueError(f"Invalid KL type: {kl_type}")
 
