@@ -802,6 +802,7 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg.get("kl_type", "forward")  
         self.mixed_kl_weight = cfg.get("mixed_kl_weight", 0.5)
         self.zero_outside_topk=cfg.get("zero_outside_topk", False)
+        self.log_infinitesimal=-23                   # log of 1e-10
         self.loss_type = LossType.TOKEN_LEVEL
     def __call__(
         self,
@@ -826,7 +827,8 @@ class DistillationLossFn(LossFunction):
 
         # Ensure float32 for stability (match other losses)
         next_token_logits = next_token_logits.to(torch.float32)
-
+        kl_type = getattr(self, "kl_type", "forward")
+        log_infinitesimal=getattr(self, "log_infinitesimal", -23)
         per_token_kl = None
         # Preferred truncated-KL path: teacher provides top-k support per position
         teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
@@ -876,6 +878,9 @@ class DistillationLossFn(LossFunction):
                 student_topk_logprobs = student_logprobs.gather(
                 dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
             )
+                if kl_type != "forward":
+                    H_all=student_logprobs.exp()*student_logprobs.sum(-1)
+                    # The entropy of the student probs [B, S-1]
             else:
                 student_topk_logits = student_logits_trimmed.gather(
                     dim=-1, index=teacher_topk_indices.to(student_logits_trimmed.device)
@@ -887,6 +892,7 @@ class DistillationLossFn(LossFunction):
             teacher_topk_logits = teacher_topk_logits.to(student_topk_logprobs.device, dtype=student_topk_logprobs.dtype)
         else:
             teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
+        
         teacher_log_probs = torch.nn.functional.log_softmax(
             teacher_topk_logits / float(tau), dim=-1
         )  # [B, S-1, k]
@@ -897,15 +903,18 @@ class DistillationLossFn(LossFunction):
             student_log_probs = torch.nn.functional.log_softmax(student_topk_logits, dim=-1) # [B, S-1, k]
         
         student_probs = student_log_probs.exp() # [B, S-1, k]
-
-        kl_type = getattr(self, "kl_type", "forward")
+        if self.zero_outside_topk and kl_type != "forward":
+            H_rest=H_all-student_topk_logprobs.exp()*student_topk_logprobs.sum(-1)
+            P_rest=1-(student_probs.sum(-1))
+            # The entropy and probof the rest of the tokens [B, S-1]
+        
         if kl_type == "forward":
             per_token_kl = teacher_probs * (
                 teacher_log_probs - student_log_probs
             )
         elif kl_type == "reverse":
             per_token_kl = student_probs * (
-                student_log_probs - teacher_log_probs
+                    student_log_probs - teacher_log_probs
             )
         elif kl_type == "mixed":
             kl_forward = teacher_probs * (
@@ -920,6 +929,16 @@ class DistillationLossFn(LossFunction):
             raise ValueError(f"Invalid KL type: {kl_type}")
         
         per_token_kl = per_token_kl.sum(dim=-1) # [B, S-1]
+
+        if self.zero_outside_topk: # if kl type is not forward, add a correction term to the loss
+            if kl_type == "forward":
+                pass
+            elif kl_type == "reverse":
+                per_token_kl=per_token_kl+H_rest-log_infinitesimal*P_rest            
+            elif kl_type == "mixed":
+                per_token_kl=per_token_kl+mixed_weight*(H_rest-log_infinitesimal*P_rest)            
+            else:
+                raise ValueError(f"Invalid KL type: {kl_type}")
 
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:
