@@ -1,13 +1,13 @@
 # Distillation Algorithm Configuration
 distillation:
-    num_prompts_per_step: 256
+    num_prompts_per_step: 128
     num_generations_per_prompt: 1
     max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     max_num_steps: 1000
-    val_batch_size: 512
-    val_period: 5
+    val_batch_size: 64
+    val_period: 10
     val_at_start: false
-    max_val_samples: 1024
+    max_val_samples: 512
     topk_logits_k: 64
     seed: 42
 
@@ -16,7 +16,7 @@ loss_fn:
     alpha: 1.0
     kl_type: "forward" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
-    zero_outside_topk: true # if true, tp should be 1: zero out the teacher logits outside the top k when calculate forward KL loss
+    zero_outside_topk: false # if true, tp should be 1: zero out the teacher logits outside the top k when calculate forward KL loss
 
 checkpointing:
     enabled: true
@@ -28,13 +28,13 @@ checkpointing:
     checkpoint_must_save_by: null
 
 policy: &POLICY_BASE
-    model_name: "Qwen/Qwen3-1.7B"
+    model_name: "Qwen/Qwen3-1.7B-Base"
     tokenizer:
         name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
-    train_global_batch_size: 256
+    train_global_batch_size: 64
     train_micro_batch_size: 1
-    generation_batch_size: 256
-    logprob_batch_size: 2
+    generation_batch_size: 64
+    logprob_batch_size: 1
     max_total_sequence_length: 16384
     precision: "bfloat16"
     logprob_chunk_size: null
@@ -44,7 +44,7 @@ policy: &POLICY_BASE
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
-        tensor_parallel_size: 1
+        tensor_parallel_size: 2
         context_parallel_size: 1
         custom_parallel_plan: null
 
@@ -126,7 +126,7 @@ policy: &POLICY_BASE
 
 teacher:
     <<: *POLICY_BASE
-    model_name: "Qwen/Qwen3-8B"
+    model_name: "Qwen/Qwen3-4B"
     dtensor_cfg:
         <<: *DTENSOR_BASE
         tensor_parallel_size: 4
