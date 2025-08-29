@@ -929,7 +929,7 @@ class DistillationLossFn(LossFunction):
                 dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
             )
                 if kl_type != "forward":
-                    H_all = student_logprobs.exp() * student_logprobs.sum(-1)
+                    H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
                     # The entropy of the student probs [B, S-1]
             else:
                 student_topk_logits = student_logits_trimmed.gather(
