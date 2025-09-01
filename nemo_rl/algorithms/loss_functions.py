@@ -954,7 +954,8 @@ class DistillationLossFn(LossFunction):
         
         student_probs = student_log_probs.exp() # [B, S-1, k]
         if self.zero_outside_topk and kl_type != "forward":
-            H_rest = H_all - (student_topk_logprobs.exp() * student_topk_logprobs).sum(-1)
+            H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
+            del H_all
             P_rest = 1 - (student_probs.sum(-1))
             # The entropy and prob of the rest of the tokens [B, S-1]
         
@@ -984,9 +985,11 @@ class DistillationLossFn(LossFunction):
             if kl_type == "forward":
                 pass
             elif kl_type == "reverse":
-                per_token_kl = per_token_kl + H_rest - log_infinitesimal * P_rest            
+                per_token_kl = per_token_kl + H_rest - log_infinitesimal * P_rest    
+                del H_rest         
             elif kl_type == "mixed":
-                per_token_kl = per_token_kl + mixed_weight * (H_rest - log_infinitesimal * P_rest)            
+                per_token_kl = per_token_kl + mixed_weight * (H_rest - log_infinitesimal * P_rest)  
+                del H_rest           
             else:
                 raise ValueError(f"Invalid KL type: {kl_type}")
 
