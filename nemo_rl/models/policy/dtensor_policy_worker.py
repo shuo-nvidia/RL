@@ -1204,6 +1204,7 @@ class DTensorPolicyWorker:
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
 
+        self.model.eval()
         out_topk_vals = []
         out_topk_idx = []
         self.model.eval()
@@ -1403,6 +1404,45 @@ class DTensorPolicyWorker:
                         else:
                             full_logits = logits.to(torch.float32)
                             vals, idx = torch.topk(full_logits[:, :, :], k=k, dim=-1)
+
+                # Handle sequence packing unpacking
+                if self.enable_seq_packing:
+                    # Unpack top-k results from packed format back to original batch format
+                    # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+                    # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+                    
+                    # Create tensors to store unpacked results
+                    unpacked_vals = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=vals.dtype,
+                        device=vals.device,
+                    )
+                    unpacked_idx = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=idx.dtype,
+                        device=idx.device,
+                    )
+                    
+                    # Get cumulative sequence lengths for unpacking
+                    cu_seqlens = flash_attn_kwargs.cu_seqlens_q
+                    
+                    for i in range(original_batch_size):
+                        start = cu_seqlens[i].item()
+                        end = cu_seqlens[i + 1].item()
+                        seq_len_actual = input_lengths[i].item()
+                        
+                        # Extract the corresponding portion from packed results
+                        # Note: vals and idx are [1, packed_seq_len, k] due to packing
+                        unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
+                        unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
+                    
+                    # Replace with unpacked results
+                    vals = unpacked_vals
+                    idx = unpacked_idx
+                    
+                    # Update batch_size and seq_len for consistency
+                    batch_size = original_batch_size
+                    seq_len = original_seq_len
 
                 # Handle sequence packing unpacking
                 if self.enable_seq_packing:
