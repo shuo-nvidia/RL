@@ -142,7 +142,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                         # 在第1维补 pad 到 max_seq_len
                         pad_length = max_seq_len - tensor.shape[1]
                         padded = torch.nn.functional.pad(
-                            tensor, (0, 0, 0, pad_length),  # 只补最后一个维度（序列长度）
+                            tensor, (0, 0, 0, pad_length),  # 只补最后二个维度（序列长度）
                             mode='constant',
                             value=pad_value
                         )

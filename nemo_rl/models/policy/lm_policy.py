@@ -373,10 +373,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],

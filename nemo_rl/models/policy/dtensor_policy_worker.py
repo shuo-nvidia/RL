@@ -1191,7 +1191,7 @@ class DTensorPolicyWorker:
         - Otherwise, computes local top-k on full-vocab tensor.
         """
         #assert not self.enable_seq_packing, "get_topk_logits: sequence packing is not supported in this method"
-        assert self.cp_size == 1, "get_topk_logits: context parallel is not supported in this method"
+        #assert self.cp_size == 1, "get_topk_logits: context parallel is not supported in this method"
 
         batch_size_total = data.get("input_ids").shape[0]
         seq_dim_size = data.get("input_ids").shape[1]
