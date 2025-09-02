@@ -347,6 +347,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 batch_size=None,
                 dynamic_batching_args=self.dynamic_batching_args,
             )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            # we just shard into DP shards here as Sequence packing allows for CP.
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
         else:
             sharded_data = data.shard_by_batch_size(  # type: ignore
                 dp_size,
@@ -377,7 +387,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
         stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
 
-        if self.use_dynamic_batches:
+        if self.use_dynamic_batches or self.use_sequence_packing:
             stacked.reorder_data(unsorted_data_indices)
 
         return stacked
