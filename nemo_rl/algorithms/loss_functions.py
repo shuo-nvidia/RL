@@ -25,6 +25,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     gather_logits_at_global_indices,
+    _compute_distributed_log_softmax
 )
 from nemo_rl.models.dtensor.parallelize import (
     get_logprobs_from_vocab_parallel_logits,
@@ -857,21 +858,65 @@ class DistillationLossFn(LossFunction):
             device_mesh = next_token_logits.device_mesh
             tp_group = device_mesh.get_group("tp")
             tp_rank = tp_group.rank()
-
             local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
             local_student_logits = local_student_logits[:, :-1, :]
+            # Ensure indices are on same device
+            teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
             V_local = int(local_student_logits.shape[-1])
             vocab_start_index = tp_rank * V_local
             vocab_end_index = (tp_rank + 1) * V_local
-            # Ensure indices are on same device
-            teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
-            student_topk_logits = gather_logits_at_global_indices(
-                local_student_logits,
-                teacher_topk_indices,
-                tp_group=tp_group,
-                vocab_start_index=vocab_start_index,
-                vocab_end_index=vocab_end_index,
-            )
+            if self.zero_outside_topk:
+                # 计算分布式log_softmax
+                student_logprobs = _compute_distributed_log_softmax(
+                    local_student_logits, group=tp_group
+                )  # [B, S-1, V_local]
+                
+                # 创建掩码，标识哪些索引在当前TP rank的范围内
+                in_range_mask = (teacher_topk_indices >= vocab_start_index) & (teacher_topk_indices < vocab_end_index)
+                
+                # 将全局索引转换为本地索引
+                local_indices = (teacher_topk_indices - vocab_start_index).clamp(min=0, max=V_local - 1)
+                
+                # 从本地logprobs中提取top-k logprobs
+                student_topk_logprobs = torch.gather(
+                    student_logprobs, dim=-1, index=local_indices
+                )  # [B, S-1, k]
+                
+                # 将不在当前TP rank范围内的logprobs设为log_infinitesimal
+                student_topk_logprobs = torch.where(
+                    in_range_mask,
+                    student_topk_logprobs,
+                    torch.full_like(student_topk_logprobs, self.log_infinitesimal)
+                )
+                
+                # 通过all_reduce合并所有TP rank的结果
+                torch.distributed.all_reduce(
+                    student_topk_logprobs,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=tp_group
+                )
+                
+                # 计算H_all（所有token的熵）
+                if kl_type != "forward":
+                    # 计算完整词汇表的熵
+                    student_probs_full = student_logprobs.exp()  # [B, S-1, V_local]
+                    H_all_local = (student_probs_full * student_logprobs).sum(-1)  # [B, S-1]
+                    
+                    # 通过all_reduce合并所有TP rank的熵
+                    torch.distributed.all_reduce(
+                        H_all_local,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=tp_group
+                    )
+                    H_all = H_all_local
+            else:
+                student_topk_logits = gather_logits_at_global_indices(
+                    local_student_logits,
+                    teacher_topk_indices,
+                    tp_group=tp_group,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_end_index,
+                )
         else:
             if self.zero_outside_topk:
                 student_logprobs = torch.nn.functional.log_softmax(student_logits_trimmed, dim=-1)
