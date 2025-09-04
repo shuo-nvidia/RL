@@ -54,7 +54,10 @@ from nemo_rl.models.dtensor.parallelize import (
     get_grad_norm,
     to_local_if_dtensor,
 )
-from nemo_rl.distributed.model_utils import distributed_vocab_topk
+from nemo_rl.distributed.model_utils import (
+    distributed_vocab_topk, 
+    allgather_cp_sharded_tensor)
+
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -78,7 +81,6 @@ from nemo_rl.utils.native_checkpoint import (
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-
 
 @contextmanager
 def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
@@ -1184,15 +1186,15 @@ class DTensorPolicyWorker:
         k: int,
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[Any]:
-        """Return per-position top-k logits and global indices (no CP/packed support).
+        """Return per-position top-k logits and global indices.
 
         Notes:
         - Operates on logits[:, :-1, :] so that positions align with next-token targets.
         - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
+        - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
-        #assert not self.enable_seq_packing, "get_topk_logits: sequence packing is not supported in this method"
-        #assert self.cp_size == 1, "get_topk_logits: context parallel is not supported in this method"
+       
 
         topk_batch_size = (
             micro_batch_size if micro_batch_size is not None else self.cfg["logprob_batch_size"]
@@ -1309,7 +1311,7 @@ class DTensorPolicyWorker:
                     with torch.autocast(device_type="cuda", dtype=self.dtype):
                         model_args = dict(
                             input_ids=input_ids,
-                            attention_mask=attention_mask,
+                            attention_mask=attention_mask_input_all_ones,
                             position_ids=position_ids,
                             use_cache=False,
                             flash_attn_kwargs=flash_attn_kwargs,
@@ -1334,12 +1336,6 @@ class DTensorPolicyWorker:
                             .squeeze(0)
                         )
 
-                        input_ids_dtensor = DTensor.from_local(
-                            input_ids,
-                            device_mesh=self.cp_mesh,
-                            placements=[Shard(sequence_dim)],
-                        )
-
                         if isinstance(logits, DTensor):
                             # Must be tp sharded
                             assert (
@@ -1359,49 +1355,34 @@ class DTensorPolicyWorker:
                                 device_mesh=self.device_mesh[("cp", "tp")],
                                 placements=[Shard(sequence_dim), Shard(-1)],
                             )
-                        # 在 CP 状态下实现 top-k 逻辑
-                        # 获取排序索引以恢复原始序列顺序
-                        _, sorted_indices = torch.sort(seq_index_tensor)
+ 
+                        # deal with TP first
+                        local_logits = logits.to_local()  # [B, S_cp, V_tp]
                         
-                        # 将 logits 转换为本地张量
-                        local_logits = logits.to_local()  # [B, S_local, V_local]
-                        
-                        # 恢复原始序列顺序
-                        local_logits = local_logits[:, sorted_indices, :]
-                        
-                        # 获取 TP 相关信息
                         tp_group = self.tp_mesh.get_group()
                         tp_rank = torch.distributed.get_rank(tp_group)
                         V_local = int(local_logits.shape[-1])
                         vocab_start_index = tp_rank * V_local
                         vocab_end_index = (tp_rank + 1) * V_local
                         
-                        # 使用分布式 top-k 计算
                         vals, idx = distributed_vocab_topk(
-                            local_logits[:, :, :],
+                            local_logits,
                             k=k,
                             tp_group=tp_group,
                             vocab_start_index=vocab_start_index,
                             vocab_end_index=vocab_end_index,
                         )
+                        # [B, S_cp, k]
+
+                        cp_group = self.cp_mesh.get_group()
                         
-                        # 将结果重新分片到 CP 维度
-                        # 注意：vals 和 idx 现在已经是全局的 top-k 结果
-                        # 我们需要将它们重新分布到 CP 分片中
-                        vals_dtensor = DTensor.from_local(
-                            vals,
-                            device_mesh=self.cp_mesh,
-                            placements=[Shard(sequence_dim)],
+                        vals = allgather_cp_sharded_tensor(
+                            vals, cp_group, seq_dim=sequence_dim
                         )
-                        idx_dtensor = DTensor.from_local(
-                            idx,
-                            device_mesh=self.cp_mesh,
-                            placements=[Shard(sequence_dim)],
+                        idx = allgather_cp_sharded_tensor(
+                            idx, cp_group, seq_dim=sequence_dim
                         )
-                        
-                        # 获取完整张量并重新排序以匹配原始序列顺序
-                        vals = vals_dtensor.full_tensor()[:, sorted_indices, :]
-                        idx = idx_dtensor.full_tensor()[:, sorted_indices, :]
+                        # [B, S, k]
                     else:
                         # Compute top-k over full sequence length (do not drop last position)
                         if isinstance(logits, DTensor):

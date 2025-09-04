@@ -5,7 +5,7 @@ distillation:
     max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     max_num_steps: 1000
     val_batch_size: 64
-    val_period: 10
+    val_period: 20
     val_at_start: false
     max_val_samples: 512
     topk_logits_k: 64
@@ -129,7 +129,7 @@ teacher:
     model_name: "Qwen/Qwen3-8B"
     dtensor_cfg:
         <<: *DTENSOR_BASE
-        context_parallel_size: 1 # [TODO]
+        context_parallel_size: 2 
         tensor_parallel_size: 4
     # generation_batch_size: 64
     # max_total_sequence_length: 8192
