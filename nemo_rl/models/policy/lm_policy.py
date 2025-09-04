@@ -694,4 +694,3 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Stop GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
-
