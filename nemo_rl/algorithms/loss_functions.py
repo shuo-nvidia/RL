@@ -823,15 +823,6 @@ class DistillationLossFn(LossFunction):
         - Aligns token positions with next-token prediction: uses logits[:, :-1] vs input_ids[:, 1:].
         - Handles DTensor/TP the same way as NLLLoss to avoid mixing DTensor with torch.Tensor in gather.
         """
-
-        '''
-        CP (Context Parallel) support has been added to this distillation loss function.
-        Implementation assumes:
-        1. Teacher topk_logits and topk_indices are NOT sharded (already gathered)
-        2. Only student logits need CP handling using allgather_cp_sharded_tensor
-        3. Follows the same pattern as from_parallel_logits_to_logprobs function
-        4. Maintains backward compatibility with non-CP modes
-        '''
         # Basic shapes
         input_ids = data["input_ids"]
         batch_size = input_ids.shape[0]
@@ -849,26 +840,25 @@ class DistillationLossFn(LossFunction):
         teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
         teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
 
-        # Don't trim yet - we'll trim after CP aggregation to ensure alignment
-        teacher_topk_logits = teacher_topk_logits[:, :-1, :]
-        teacher_topk_indices = teacher_topk_indices[:, :-1, :]
-
         if cp_size>1:   # if use cp, we will trim the student sequence length after CP aggregation
-            pass
+            student_logits_trimmed = next_token_logits
         else:         
-            next_token_logits = next_token_logits[:, :-1, :]
+            student_logits_trimmed = next_token_logits[:, :-1, :]
+            teacher_topk_logits = teacher_topk_logits[:, :-1, :]
+            teacher_topk_indices = teacher_topk_indices[:, :-1, :]
             
         if vocab_parallel_group is not None:
             assert vocab_parallel_rank is not None, (
                 "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
             )
-            V_local = int(next_token_logits.shape[-1])
+            V_local = int(student_logits_trimmed.shape[-1])
             vocab_start_index = vocab_parallel_rank * V_local
             vocab_end_index = (vocab_parallel_rank + 1) * V_local
             student_topk_logits = gather_logits_at_global_indices(
-                next_token_logits,
+                student_logits_trimmed,
                 teacher_topk_indices,
                 tp_group=vocab_parallel_group,
+                cp_group=cp_group,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
             )
@@ -877,8 +867,12 @@ class DistillationLossFn(LossFunction):
             device_mesh = next_token_logits.device_mesh
             tp_group = device_mesh.get_group("tp")
             tp_rank = tp_group.rank()
-
+            
             local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
+            if cp_size>1:
+                pass
+            else:
+                local_student_logits = local_student_logits[:, :-1, :]
             V_local = int(local_student_logits.shape[-1])
             vocab_start_index = tp_rank * V_local
             vocab_end_index = (tp_rank + 1) * V_local
@@ -888,18 +882,13 @@ class DistillationLossFn(LossFunction):
                 local_student_logits,
                 teacher_topk_indices,
                 tp_group=tp_group,
+                cp_group=cp_group,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
             )
         else:
-            # Handle CP support for student logits (assuming teacher is not sharded)
-
-                # Gather student logits from CP shards
-            #student_logits_trimmed = next_token_logits
-
-            
             if self.zero_outside_topk:
-                student_logprobs = torch.nn.functional.log_softmax(next_token_logits, dim=-1)
+                student_logprobs = torch.nn.functional.log_softmax(student_logits_trimmed, dim=-1)
                 student_topk_logprobs = student_logprobs.gather(
                 dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
             )
@@ -907,8 +896,8 @@ class DistillationLossFn(LossFunction):
                     H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
                     # The entropy of the student probs [B, S-1]
             else:
-                student_topk_logits = next_token_logits.gather(
-                    dim=-1, index=teacher_topk_indices.to(next_token_logits.device)
+                student_topk_logits = student_logits_trimmed.gather(
+                    dim=-1, index=teacher_topk_indices.to(student_logits_trimmed.device)
                 )
 
         tau = float(data.get("tau", self.temperature))
@@ -919,22 +908,25 @@ class DistillationLossFn(LossFunction):
         else:
             teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
         
+
+        if cp_size>1:
+            teacher_topk_logits = teacher_topk_logits[:, :-1, :]
+            student_topk_logits = student_topk_logits[:, :-1, :]
+
         teacher_log_probs = torch.nn.functional.log_softmax(
             teacher_topk_logits / float(tau), dim=-1
-        )  # [B, S-1, k]
-        teacher_probs = teacher_log_probs.exp() # [B, S-1, k]
+        )  
+
         if self.zero_outside_topk:
             student_log_probs = student_topk_logprobs
         else:
             student_log_probs = torch.nn.functional.log_softmax(student_topk_logits, dim=-1) # [B, S-1, k]
            
-        if cp_size>1:
-            student_log_probs = allgather_cp_sharded_tensor(
-                        student_log_probs, cp_group, seq_dim=1
-                    )
-            student_log_probs=student_log_probs[:, :-1, :] # trim the student sequence length
+        # CP handling is now done inside gather_logits_at_global_indices
+        # No need for manual CP gather here
         
         student_probs = student_log_probs.exp() # [B, S-1, k]
+        teacher_probs = teacher_log_probs.exp() # [B, S-1, k]
         if self.zero_outside_topk and kl_type != "forward":
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
             del H_all
