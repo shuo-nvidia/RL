@@ -27,7 +27,6 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
 from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
-from nemo_rl.data.hf_datasets.math_cl import MathCLDataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -160,93 +159,29 @@ def setup_data(
     dict[str, EnvironmentInterface],
 ]:
     print("\n▶ Setting up data...")
-    
-    prompt_file = data_config["prompt_file"]
-    system_prompt_file = data_config["system_prompt_file"]
+    math_task_spec = TaskDataSpec(
+        task_name="math",
+        prompt_file=data_config["prompt_file"],
+        system_prompt_file=data_config["system_prompt_file"],
+    )
 
-    import os
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    if not os.path.isabs(prompt_file):
-        prompt_file = os.path.join(current_dir, "prompts", prompt_file)
-    
-    if system_prompt_file is not None and not os.path.isabs(system_prompt_file):
-        system_prompt_file = os.path.join(current_dir, "prompts", system_prompt_file)
-    
-
-    if os.path.exists(prompt_file):
-        try:
-            with open(prompt_file, 'r', encoding='utf-8') as f:
-                prompt_content = f.read()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-    else:
-        prompt_dir = os.path.dirname(prompt_file)
-        if os.path.exists(prompt_dir):
-            try:
-                files = os.listdir(prompt_dir)
-            except Exception as e:
-                raise ValueError(f"Failed to list directory: {e}")
-        else:
-            raise ValueError(f"Prompt directory does not exist: {prompt_dir}")
-
-    
-    # Create TaskDataSpec
-    try:
-        math_task_spec = TaskDataSpec(
-            task_name="math",
-            prompt_file=prompt_file,
-            system_prompt_file=system_prompt_file,
-        )
-    except Exception as e: 
-        # manually load prompt file
-        try:
-            with open(prompt_file, 'r', encoding='utf-8') as f:
-                manual_prompt = f.read()
-                math_task_spec = TaskDataSpec(
-                    task_name="math",
-                    prompt_file=None,
-                    system_prompt_file=None,
-                )
-                # manually set prompt
-                math_task_spec.prompt = manual_prompt
-                math_task_spec.system_prompt = None
-                
-        except Exception as e2:
-            import traceback
-            traceback.print_exc()
-            raise RuntimeError(f"Failed to create TaskDataSpec: {e}")
-
-    if math_task_spec.prompt is None:
-        try:
-            with open(prompt_file, 'r', encoding='utf-8') as f:
-                manual_prompt = f.read()
-                math_task_spec.prompt = manual_prompt
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-
-    # Load dataset using nemo rl datasets
+    # Load OpenMathInstruct2Dataset using nemo rl datasets
     if data_config["dataset_name"] == "OpenMathInstruct-2":
         print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
         data: Any = OpenMathInstruct2Dataset(seed=seed)
     elif data_config["dataset_name"] == "DeepScaler":
-        print("Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation")
-        data: Any = DeepScalerDataset(seed=seed)
-    elif data_config["dataset_name"] == "pe-nlp/math-cl":
-        print("Loading pe-nlp/math-cl dataset for training and validation")
-        data: Any = MathCLDataset(
-            seed=seed,
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
+        print(
+            "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
+        data: Any = DeepScalerDataset(seed=seed)
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
 
-    task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = {}
+    task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
+        defaultdict(lambda: (math_task_spec, hf_data_processor))
+    )
     task_data_processors["math"] = (math_task_spec, hf_data_processor)
-    
+
     math_env = MathEnvironment.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
             "py_executable": get_actor_python_env(
@@ -341,13 +276,15 @@ def main() -> None:
         val_dataloader,
         tokenizer,  # pass tokenizer parameter
         loss_fn,
+        task_to_env,
+        val_task_to_env,
         logger,
         checkpointer,
         distillation_state,
         master_config,
-        task_to_env,  # Add the missing task_to_env parameter
     )
 
 
 if __name__ == "__main__":
     main()
+
