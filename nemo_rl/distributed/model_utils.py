@@ -697,6 +697,8 @@ def get_logprobs_from_vocab_parallel_logits(
         seq_index=seq_index,
         chunk_size=chunk_size,
     )
+
+
 @torch.no_grad()
 def distributed_vocab_topk(
     vocab_parallel_logits: torch.Tensor,

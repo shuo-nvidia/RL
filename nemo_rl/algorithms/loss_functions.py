@@ -14,6 +14,7 @@
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
+import torch.distributed
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.utils import (
@@ -23,6 +24,12 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
+    gather_logits_at_global_indices,
+    _get_tokens_on_this_cp_rank,
+    allgather_cp_sharded_tensor
+    
+)
+from nemo_rl.models.dtensor.parallelize import (
     get_logprobs_from_vocab_parallel_logits,
     compute_global_exp_logits_and_max,
     gather_logits_at_global_indices,
@@ -969,7 +976,6 @@ class DistillationLossFn(LossFunction):
         else:
             teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
         
-
         if cp_size>1:
             teacher_topk_logits = teacher_topk_logits[:, :-1, :]
             student_topk_logits = student_topk_logits[:, :-1, :]

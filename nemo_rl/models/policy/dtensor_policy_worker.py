@@ -1194,7 +1194,10 @@ class DTensorPolicyWorker:
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
+<<<<<<< HEAD
        
+=======
+>>>>>>> origin/feat-distillation
 
         topk_batch_size = (
             micro_batch_size if micro_batch_size is not None else self.cfg["logprob_batch_size"]
@@ -1204,7 +1207,10 @@ class DTensorPolicyWorker:
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
 
+<<<<<<< HEAD
         self.model.eval()
+=======
+>>>>>>> origin/feat-distillation
         out_topk_vals = []
         out_topk_idx = []
         self.model.eval()
@@ -1236,7 +1242,10 @@ class DTensorPolicyWorker:
             else:
                 mb_iterator = data.make_microbatch_iterator(topk_batch_size)
                 iterator_len = data.size // topk_batch_size
+<<<<<<< HEAD
 
+=======
+>>>>>>> origin/feat-distillation
                 
             for batch_idx, lp_batch in enumerate(
                 itertools.chain(mb_iterator, dummy_iterator)
