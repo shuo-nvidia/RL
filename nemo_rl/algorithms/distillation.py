@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
 import os
+import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import ray
 import torch
+import numpy as np
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms.loss_functions import (
@@ -28,7 +30,6 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
@@ -36,6 +37,10 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+)
+from nemo_rl.data.llm_message_utils import (
+    batched_message_log_to_flat_message,
+    get_keys_from_message_log,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -45,10 +50,13 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
+    print_message_log_samples,
 )
-from nemo_rl.utils.timer import Timer
-from nemo_rl.experience.rollouts import run_multi_turn_rollout
+from nemo_rl.utils.timer import Timer, TimeoutChecker
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.rollouts import run_multi_turn_rollout, run_async_multi_turn_rollout
+from nemo_rl.algorithms.grpo import _should_use_async_rollouts
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 
 # ===============================================================================
 # Configuration
@@ -61,7 +69,7 @@ class DistillationConfig(TypedDict):
     generate_strategy: dict[str, Any] # Generation strategy parameters
     
     # Training configuration
-    max_steps: int
+    max_num_steps: int
     eval_steps: int
     save_steps: int
     logging_steps: int
@@ -70,6 +78,7 @@ class DistillationConfig(TypedDict):
 class MasterConfig(TypedDict):
     """Main configuration structure"""
     policy: PolicyConfig             # Student model configuration
+    teacher: PolicyConfig            # Teacher model configuration
     loss_fn: DistillationLossConfig  # Loss function configuration
     env: dict[str, Any]              # Environment configuration
     data: DataConfig                 # Data configuration
@@ -81,14 +90,16 @@ class MasterConfig(TypedDict):
 
 class DistillationSaveState(TypedDict):
     step: int
-    val_loss: NotRequired[float]
+    val_reward: NotRequired[float]
     consumed_samples: int
+    # epoch: int
 
 
 def _default_distillation_save_state() -> DistillationSaveState:
     return {
         "step": 0,
         "consumed_samples": 0,
+        # "epoch": 0,
     }
 
 
@@ -121,6 +132,7 @@ def setup(
     """
     # Extract configuration
     policy_config = master_config["policy"]
+    teacher_config = master_config["teacher"]
     generation_config = master_config["policy"]["generation"]
     loss_config = master_config["loss_fn"]
     distillation_config = master_config["distillation"]
@@ -175,7 +187,7 @@ def setup(
     if val_dataset is not None:
         val_dataloader = StatefulDataLoader(
             val_dataset,
-            batch_size=distillation_config["num_prompts_per_step"],  
+            batch_size=distillation_config["val_batch_size"],  
             shuffle=False,
             collate_fn=rl_collate_fn,
         )
@@ -291,8 +303,6 @@ def setup(
     # Checkpoint paths
     weights_path = None
     optimizer_path = None
-    teacher_config = policy_config.copy()
-    teacher_config["model_name"] = distillation_config["teacher_model_path"]
 
     teacher_policy = Policy(
         name_prefix="teacher",
@@ -422,719 +432,494 @@ def refit_student_generation(
         student_generation.prepare_for_generation(tags=["kv_cache"])
 
 
-def validate(
-    teacher_policy: ColocatablePolicyInterface, 
-    student_policy: ColocatablePolicyInterface,
-    student_generation: GenerationInterface,
-    val_dataloader: Optional[StatefulDataLoader],
-    tokenizer: TokenizerType,
-    loss_fn: DistillationLossFn,
-    decoding_method: str,
-    step: int,
-    master_config: MasterConfig,
-    task_to_env: dict[str, EnvironmentInterface],  # Add environment parameter
-) -> dict[str, Any]:
-    """Run validation on the validation dataset for distillation"""
-    if val_dataloader is None:
-        print("  ⚠️ No validation dataloader provided, skipping validation")
-        return {}
-    timer = Timer()
-    with timer.time("total_validation_time"):
-        print(f"▶ Starting validation at step {step}...")
-
-        total_losses = []
-        total_samples = 0
-
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if student_generation is not None:
-                try:
-                    val_batch, rollout_metrics = run_multi_turn_rollout(
-                        policy_generation=student_generation,
-                        input_batch=val_batch,
-                        tokenizer=tokenizer,
-                        task_to_env=task_to_env,  # use the provided environment parameter
-                        max_seq_len=master_config["policy"]["max_total_sequence_length"],  
-                        max_rollout_turns=1, 
-                        greedy=(decoding_method == "greedy"), 
-                    )
-                    
-                    # loss calculation
-                    try:
-                        # 从message_log中提取input_ids，就像训练阶段一样
-                        message_logs = val_batch["message_log"]
-                        batched_flat, input_lengths = batched_message_log_to_flat_message(
-                            message_logs,
-                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        )
-                        val_input_ids = batched_flat["token_ids"]
-                        val_batch_size = val_input_ids.shape[0]
-                        
-                        # 创建包含input_ids和input_lengths的验证批次数据
-                        val_batch_for_logprobs = BatchedDataDict({
-                            "input_ids": val_input_ids,
-                            "input_lengths": input_lengths,
-                        })
-                        
-                        # 🔑 关键修复：将数据移到CPU，减少GPU内存占用
-                        val_batch_for_logprobs.to("cpu")
-                        
-                        with torch.no_grad():
-                            student_policy.prepare_for_lp_inference()
-                            teacher_policy.prepare_for_lp_inference()
-                            
-                            # 先获取teacher logprobs，然后立即卸载
-                            val_teacher_logprobs = teacher_policy.get_logprobs(val_batch_for_logprobs)["logprobs"]
-                            teacher_policy.offload_before_refit()  # 🔑 关键：立即卸载teacher模型
-                            
-                            # 再获取student logprobs
-                            val_student_logits = student_policy.get_logprobs(val_batch_for_logprobs)["logprobs"]
-
-                        val_data_dict = {
-                            "input_ids": val_input_ids,
-                            "teacher_logprobs": val_teacher_logprobs,
-                        }
-                        val_data = BatchedDataDict[DistillationLossDataDict](val_data_dict)
-                        val_loss, val_metrics = loss_fn(
-                            val_student_logits,
-                            val_data,
-                            torch.ones(val_batch_size, dtype=torch.bool),
-                            torch.ones_like(val_input_ids, dtype=torch.bool),
-                        )
-                        
-                        batch_loss = val_loss.item()
-                        
-                        # 🔑 关键：在验证完成后卸载teacher模型
-                        teacher_policy.offload_after_refit()
-                        
-                    except Exception as e:
-                        # 确保在异常情况下也卸载teacher模型
-                        try:
-                            teacher_policy.offload_after_refit()
-                        except:
-                            pass
-                        raise e
-                    
-                    batch_size = len(val_batch) if hasattr(val_batch, '__len__') else 1
-                    total_losses.append(batch_loss)
-                    total_samples += batch_size
-                    
-                except Exception as e:
-                    raise e
-            else:
-                # 如果使用megatron后端，直接使用policy
-                try:
-                    # 实现megatron的验证逻辑
-                    # 从message_log中提取input_ids，就像训练阶段一样
-                    message_logs = val_batch["message_log"]
-                    batched_flat, input_lengths = batched_message_log_to_flat_message(
-                        message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    val_input_ids = batched_flat["token_ids"]
-                    val_batch_size = val_input_ids.shape[0]
-                    
-                    # 🔑 关键修复：将数据移到CPU，减少GPU内存占用
-                    val_input_ids = val_input_ids.to("cpu")
-                    
-                    # 获取学生模型在验证数据上的logits
-                    with torch.no_grad():
-                        student_policy.prepare_for_lp_inference()
-                        val_student_logits = student_policy.get_forward_logits(val_input_ids)
-                    
-                    # 创建验证数据字典
-                    val_data = {
-                        "input_ids": val_input_ids,
-                        "student_logits": val_student_logits,
-                        "teacher_logits": torch.randn_like(val_student_logits) * 0.5,
-                    }
-                    
-                    # 计算验证loss
-                    val_loss, val_loss_metrics = loss_fn(
-                        val_student_logits,
-                        val_data,
-                        torch.ones(val_batch_size, dtype=torch.bool),
-                        torch.ones_like(val_input_ids, dtype=torch.bool),
-                    )
-                    
-                    batch_loss = val_loss.item()
-                    print(f"  🔍 [Validation] Batch {batch_idx}: Loss = {batch_loss:.6f}")
-                    
-                except Exception as e:
-                    print(f"  ⚠️ Error computing validation loss: {e}")
-                    batch_loss = 0.1  # 使用默认值
-                
-                batch_size = len(val_batch) if hasattr(val_batch, '__len__') else 1
-                total_losses.append(batch_loss)
-                total_samples += batch_size
-    return val_metrics
+# ===============================================================================
+# Training & Validation
+# ===============================================================================
 
 
 def distillation_train(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
     student_generation: Optional[GenerationInterface],
-    train_dataloader: StatefulDataLoader,
+    dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
-    tokenizer: TokenizerType, 
+    tokenizer: TokenizerType,
     loss_fn: DistillationLossFn,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     logger: Logger,
     checkpointer: CheckpointManager,
     distillation_save_state: DistillationSaveState,
     master_config: MasterConfig,
-    task_to_env: dict[str, EnvironmentInterface],  # Add environment parameter like GRPO
 ) -> None:
-    """Distillation training main function"""
-    
-    
+    """Run GRPO training algorithm."""
     timer = Timer()
-    distillation_config = master_config["distillation"]
-    generation_config = master_config["policy"]["generation"]
-    
-    # set generation strategy
-    generate_strategy = distillation_config.get("generate_strategy", {})
-    max_length = generate_strategy.get("max_length", 2048)
-    temperature = generate_strategy.get("temperature", 1.0)
-    decoding_method = generate_strategy.get("decoding_method", "greedy")
-    
-    # if policy_generation is None, use policy as generation interface
+    timeout = TimeoutChecker(
+        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        fit_last_save_time=True,
+    )
+    timeout.start_iterations()
+
     NEED_REFIT = True
+    # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if student_generation is None:
-        pass
-        student_generation = student_policy  
+        student_generation = student_policy  # type: ignore
         NEED_REFIT = False
-    STUDENT_GENERATION_STALE = True        # tracks if generation needs a refit before running
+    POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert student_generation is not None  # for mypy type check
-    
-    # get colocated inference setting
-    colocated_inference = generation_config["colocated"]["enabled"]
-    
-    # training loop
+
+    # common config/state itmes
     step = distillation_save_state["step"]
-    max_steps = distillation_config["max_steps"]
-    
-    print(f"Starting from step {step}, max steps: {max_steps}")
-    print(f"Generation config: max_length={max_length}, temperature={temperature}, decoding_method={decoding_method}")
-    
-    try:
-        for batch_idx, batch in enumerate(train_dataloader):
-            if step >= max_steps:
-                break
-                
-            print(f"\n{'=' * 25} Step {step + 1}/{max_steps} {'=' * 25}")
-            
+    consumed_samples = distillation_save_state["consumed_samples"]
+    # epoch = distillation_save_state["epoch"]
+    val_period = master_config["distillation"]["val_period"]
+    val_at_start = master_config["distillation"]["val_at_start"]
+    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    # max_num_epochs = master_config["distillation"].get("max_num_epochs", 1)
+
+    # Run validation at the start if configured
+    if val_at_start and step == 0:
+        print("\n🔍 Running initial validation...")
+        if NEED_REFIT and POLICY_GENERATION_STALE:
+            refit_student_generation(student_policy, student_generation, colocated_inference)
+            POLICY_GENERATION_STALE = False
+        else:
+            student_generation.prepare_for_generation()
+        val_metrics, validation_timings = validate(
+            student_generation,
+            val_dataloader,
+            tokenizer,
+            val_task_to_env,
+            step=0,
+            master_config=master_config,
+        )
+        student_generation.finish_generation()
+        logger.log_metrics(val_metrics, step, prefix="validation")
+        logger.log_metrics(validation_timings, step, prefix="timing/validation")
+
+    # Run grpo training (multi-epoch until reaching max_num_steps)
+    batch: BatchedDataDict[DatumSpec]
+    max_steps = master_config["distillation"]["max_num_steps"]
+
+    while step < max_steps:
+        for batch in dataloader:
+            print(
+                f"\n{'=' * 25} Step {step + 1}/{max_steps} {'=' * 25}"
+            )
+            maybe_gpu_profile_step(student_policy, step + 1)
+            if student_policy != student_generation:
+                maybe_gpu_profile_step(student_generation, step + 1)
+            val_metrics, validation_timings = None, None
+
             with timer.time("total_step_time"):
-                #prepare batch data
-                
+                # Prepare batch
+                print("▶ Preparing batch...")
                 with timer.time("data_processing"):
-                    # extract message_log from batch
-                    batch: BatchedDataDict[DatumSpec]
-                    message_logs = batch["message_log"]
-                
-                    try:
-                        batched_flat, input_lengths = batched_message_log_to_flat_message(
-                            message_logs,
-                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        )
-                        input_ids = batched_flat["token_ids"]
-                    except Exception as e:
-                        import traceback
-                        traceback.print_exc()
-                        raise
-                
-                # check if refit is needed
-                    
-                if NEED_REFIT or STUDENT_GENERATION_STALE:
-                    generation_config = {
-                        'temperature': temperature,
-                        'decoding_method': decoding_method,
-                        'max_length': max_length,
-                    }
-                    refit_student_generation(student_policy, student_generation, colocated_inference, generation_config=generation_config, master_config=master_config)
-                    STUDENT_GENERATION_STALE = False
-                else:
-                    student_generation.prepare_for_generation()
-
-                if student_generation is not None:
-                    from nemo_rl.models.generation.interfaces import GenerationDatumSpec
-                    
-                    # Use the provided task_to_env instead of hardcoding environment creation
-                    # The environment should be created and configured at the caller level
-                    
-                    num_generations_per_prompt = master_config["distillation"]["num_generations_per_prompt"]
-                    
+                    # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(
-                        num_repeats=num_generations_per_prompt
+                        master_config["distillation"]["num_generations_per_prompt"]
                     )
-                    
-                    max_seq_len = master_config["policy"]["max_total_sequence_length"]
-                    max_new_tokens = distillation_config["generate_strategy"]["max_new_tokens"]
-                    max_input_len = max_seq_len - max_new_tokens
-                    
-                    # avoid remaining_length becoming negative
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        total_length = sum(len(msg["token_ids"]) for msg in message_log)
-                        if total_length > max_input_len:
-                            # recalculate the number of tokens to keep
-                            tokens_to_keep = max_input_len
-                            
-                            # keep tokens in order from the first message
-                            for msg in message_log:
-                                if tokens_to_keep <= 0:
-                                    # if all available tokens are used, only keep the first token
-                                    if len(msg["token_ids"]) > 0:
-                                        msg["token_ids"] = msg["token_ids"][:1]
-                                else:
-                                    msg_length = len(msg["token_ids"])
-                                    if msg_length > tokens_to_keep:
-                                        # if the current message is too long, truncate to available length
-                                        msg["token_ids"] = msg["token_ids"][:tokens_to_keep]
-                                        tokens_to_keep = 0
-                                    else:
-                                        # if the current message can be fully retained
-                                        tokens_to_keep -= msg_length
-                            
-                            # recalculate length and verify
-                            new_total_length = sum(len(msg["token_ids"]) for msg in message_log)
-                            
-                            # verify that the truncated length does not exceed the limit
-                            if new_total_length > max_input_len:
-                                # force truncation to the limit
-                                for msg in message_log:
-                                    if len(msg["token_ids"]) > 0:
-                                        msg["token_ids"] = msg["token_ids"][:1]
-                                        break
-                    
-                    # use rollout to generate response
-                    try:
-                        generated_batch, rollout_metrics = run_multi_turn_rollout(
+                    # Convert LLMMessageLogType to FlatMessagesType for generation
+                    batched_flat, input_lengths = batched_message_log_to_flat_message(
+                        repeated_batch["message_log"],
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                    )
+                    input_ids = batched_flat["token_ids"]
+
+                # Generate responses - this updates the LLMMessageLogType in repeated_batch
+                print(f"▶ Generating responses for batch of size {repeated_batch.size}...")
+                with timer.time("prepare_for_generation"):
+                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                        refit_student_generation(
+                            student_policy, student_generation, colocated_inference, timer=timer
+                        )
+                        POLICY_GENERATION_STALE = False
+                    else:
+                        student_generation.prepare_for_generation()
+
+                with timer.time("generation"):
+                    # Use async rollouts if vLLM async engine is enabled
+                    if _should_use_async_rollouts(master_config):
+                        (
+                            repeated_batch,
+                            rollout_metrics,
+                        ) = run_async_multi_turn_rollout(
                             policy_generation=student_generation,
-                            input_batch=repeated_batch,  # use repeated batch
+                            input_batch=repeated_batch,
                             tokenizer=tokenizer,
-                            task_to_env=task_to_env,  # use the provided environment parameter
-                            max_seq_len=max_seq_len,  # directly use policy's max_total_sequence_length
-                            max_rollout_turns=1,  # distillation only needs single-turn generation
-                            greedy=(decoding_method == "greedy"),  # determine if greedy based on decoding_method
+                            task_to_env=task_to_env,
+                            max_seq_len=master_config["policy"][
+                                "max_total_sequence_length"
+                            ],
+                            max_rollout_turns=master_config["distillation"]["max_rollout_turns"],
+                            greedy=False,
                         )
-                        # extract generated sequences from rollout results
-                        generated_sequences = generated_batch["message_log"]
-                        
-                    except Exception as e:
-                        try:                    
-                            # prepare input data
-                            input_ids = []
-                            for message_log in repeated_batch["message_log"]:
-                                # merge all message's token_ids
-                                sample_tokens = []
-                                for msg in message_log:
-                                    if "token_ids" in msg and len(msg["token_ids"]) > 0:
-                                        sample_tokens.extend(msg["token_ids"].tolist())
-                                
-                                if len(sample_tokens) == 0:
-                                    # if the sequence is empty, add pad token
-                                    sample_tokens = [tokenizer.pad_token_id]
-                                
-                                # apply length limit in fallback
-                                if len(sample_tokens) > max_input_len:
-                                    sample_tokens = sample_tokens[:max_input_len]
-                                
-                                input_ids.append(sample_tokens)
-                            
-                            # pad to the same length
-                            max_len = max(len(ids) for ids in input_ids)
-                            padded_input_ids = []
-                            for ids in input_ids:
-                                if len(ids) < max_len:
-                                    ids.extend([tokenizer.pad_token_id] * (max_len - len(ids)))
-                                padded_input_ids.append(ids)
-                            
-                            # convert to tensor
-                            input_ids_tensor = torch.tensor(padded_input_ids, dtype=torch.long)
-                            input_lengths_tensor = torch.tensor([len(ids) for ids in input_ids], dtype=torch.long)
-                            
-                            # generate directly
-                            generation_data = BatchedDataDict[GenerationDatumSpec]({
-                                "input_ids": input_ids_tensor,
-                                "input_lengths": input_lengths_tensor,
-                                "stop_strings": [None] * len(input_ids),
-                            })
-                            
-                            generation_outputs = student_generation.generate(
-                                generation_data, 
-                                greedy=(decoding_method == "greedy")
-                            )
-                            
-                            # process generation results
-                            output_ids = generation_outputs["output_ids"]
-                            generated_sequences = []
-                            
-                            for i in range(len(input_ids)):
-                                input_len = input_lengths_tensor[i].item()
-                                generated_tokens = output_ids[i, input_len:].tolist()
-                                
-                                # create assistant message
-                                assistant_message = {
-                                    "role": "assistant",
-                                    "content": tokenizer.decode(generated_tokens, skip_special_tokens=True),
-                                    "token_ids": torch.tensor(generated_tokens, dtype=torch.long),
-                                }
-                                
-                                # reconstruct message_log
-                                sample_messages = []
-                                for msg in repeated_batch["message_log"][i]:
-                                    sample_messages.append(msg)
-                                sample_messages.append(assistant_message)
-                                generated_sequences.append(sample_messages)
-                            
-                        except Exception as fallback_error:
-                            import traceback
-                            traceback.print_exc()
-                            raise RuntimeError(f"Both rollout and fallback generation failed. Original error: {e}, Fallback error: {fallback_error}")
-                else:
-                    # if using megatron backend, use policy directly
-                    # here we need to implement the generation logic of megatron
-                    generated_sequences = batch["message_log"]  # use original data temporarily
-                
-                # mark generation as completed
-                if student_generation is not None:
+                    else:
+                        repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                            policy_generation=student_generation,
+                            input_batch=repeated_batch,
+                            tokenizer=tokenizer,
+                            task_to_env=task_to_env,
+                            max_seq_len=master_config["policy"][
+                                "max_total_sequence_length"
+                            ],
+                            max_rollout_turns=master_config["distillation"]["max_rollout_turns"],
+                            greedy=False,
+                        )
                     student_generation.finish_generation()
-                
-                # calculate logits
-                
-                with timer.time("logits_computation"):
-                    try:
-                        expected_batch_size = master_config["distillation"]["num_prompts_per_step"] * master_config["distillation"]["num_generations_per_prompt"]
 
-                        if len(generated_sequences) != expected_batch_size:
-                            if len(generated_sequences) > expected_batch_size:
-                                generated_sequences = generated_sequences[:expected_batch_size]
+                with timer.time("data_processing"):
+                    # Add loss mask and advantages to each message in LLMMessageLogType
+                    for i, message_log in enumerate(repeated_batch["message_log"]):
+                        for j, message in enumerate(message_log):
+                            if message["role"] == "assistant":
+                                message["token_loss_mask"] = torch.ones_like(
+                                    message["token_ids"]
+                                )
                             else:
-                                # expand batch to the correct size (repeat the last sequence)
-                                while len(generated_sequences) < expected_batch_size:
-                                    generated_sequences.append(generated_sequences[-1])
+                                message["token_loss_mask"] = torch.zeros_like(
+                                    message["token_ids"]
+                                )
+                            if "generation_logprobs" not in message:
+                                message["generation_logprobs"] = torch.zeros_like(
+                                    message["token_ids"], dtype=torch.float32
+                                )
 
-                        
-                        flat_messages, input_lengths = batched_message_log_to_flat_message(
-                            generated_sequences,
-                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                            make_sequence_length_divisible_by=master_config["policy"].get(
-                                "make_sequence_length_divisible_by", 1
-                            ),
-                        )
+                    # Convert updated LLMMessageLogType to FlatMessagesType for training
+                    flat_messages, input_lengths = batched_message_log_to_flat_message(
+                        repeated_batch["message_log"],
+                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        make_sequence_length_divisible_by=master_config["policy"][
+                            "make_sequence_length_divisible_by"
+                        ],
+                    )
 
-                    except Exception as e:
-                        raise
-                    
-                    # prepare training data
-                    
-                    
-                    if "token_loss_mask" not in flat_messages:
-                        token_loss_mask = torch.zeros_like(
-                            flat_messages["token_ids"], dtype=torch.bool
-                        )
-                        
-                        for i, seq_len in enumerate(input_lengths):
-                            if seq_len > 0:
-                                token_loss_mask[i, :seq_len] = True
-                        
-                        flat_messages["token_loss_mask"] = token_loss_mask
-                    
-                    # verify that all fields have consistent batch dimensions
-                    expected_batch_size = flat_messages['token_ids'].shape[0]
-                    expected_seq_len = flat_messages['token_ids'].shape[1]
-                    
-                    # verify and fix fields with mismatched shapes
-                    
-                    if flat_messages['token_loss_mask'].shape[0] != expected_batch_size:
-                        flat_messages['token_loss_mask'] = flat_messages['token_loss_mask'][:expected_batch_size]
-                    
-                    if repeated_batch['loss_multiplier'].shape[0] != expected_batch_size:
-                        repeated_batch['loss_multiplier'] = repeated_batch['loss_multiplier'][:expected_batch_size]
-                    
-                    if flat_messages['token_loss_mask'].shape[1] != expected_seq_len:
-                        if flat_messages['token_loss_mask'].shape[1] > expected_seq_len:
-                            flat_messages['token_loss_mask'] = flat_messages['token_loss_mask'][:, :expected_seq_len]
-                        else:
-                            flat_messages['token_loss_mask'] = flat_messages['token_loss_mask'].expand(-1, expected_seq_len)
-                    
-                    
-                    # ensure loss_multiplier is the correct shape
-                    if isinstance(repeated_batch["loss_multiplier"], torch.Tensor):
-                        if len(repeated_batch["loss_multiplier"].shape) > 1:
-                            # if loss_multiplier is multi-dimensional, take the first dimension
-                            repeated_batch["loss_multiplier"] = repeated_batch["loss_multiplier"].flatten()[:expected_batch_size]
-                            
-                        elif repeated_batch["loss_multiplier"].shape[0] != expected_batch_size:
-                            repeated_batch["loss_multiplier"] = repeated_batch["loss_multiplier"][:expected_batch_size]
-                            
-                    elif isinstance(repeated_batch["loss_multiplier"], list):
-                        repeated_batch["loss_multiplier"] = torch.tensor(repeated_batch["loss_multiplier"][:expected_batch_size], dtype=torch.float32)
-                        
+                    # Create training data from flattened messages
+                    train_data = BatchedDataDict[DistillationLossDataDict](
+                        {
+                            "input_ids": flat_messages["token_ids"],
+                            "input_lengths": input_lengths,
+                            "token_mask": flat_messages["token_loss_mask"],
+                            "sample_mask": repeated_batch["loss_multiplier"],
+                        }
+                    )
+                    # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                    train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+                    train_data.to("cpu")
 
-                    
-                    # finally verify the type and shape of loss_multiplier
-                    if not isinstance(repeated_batch["loss_multiplier"], torch.Tensor):
-                        if isinstance(repeated_batch["loss_multiplier"], (list, tuple)):
-                            repeated_batch["loss_multiplier"] = torch.tensor(repeated_batch["loss_multiplier"], dtype=torch.float32)
-                         
-                        elif isinstance(repeated_batch["loss_multiplier"], (int, float)):
-                            repeated_batch["loss_multiplier"] = torch.tensor([repeated_batch["loss_multiplier"]] * expected_batch_size, dtype=torch.float32)
-                            
-                        else:
-                            # create default loss_multiplier
-                            repeated_batch["loss_multiplier"] = torch.ones(expected_batch_size, dtype=torch.float32)
-                           
-                    
-                    # verify that all fields have consistent batch dimensions
-                    all_batch_sizes = [
-                        flat_messages['token_ids'].shape[0],
-                        input_lengths.shape[0],
-                        flat_messages['token_loss_mask'].shape[0],
-                        repeated_batch['loss_multiplier'].shape[0]
-                    ]
-                    
-                    if len(set(all_batch_sizes)) != 1:
-                        raise ValueError(f"Batch dimensions must be consistent, got: {all_batch_sizes}")
-                    
-                    # create training data, only include tensor fields
-                    train_data_dict = {
-                        "input_ids": flat_messages["token_ids"],
-                        "input_lengths": input_lengths,
-                        "token_mask": flat_messages["token_loss_mask"],  # use token_loss_mask instead of custom token_mask
-                        "sample_mask": repeated_batch["loss_multiplier"],
-                    }
-                    
-                    train_data = BatchedDataDict[DistillationLossDataDict](train_data_dict)
-                    train_data.to("cpu")  
+                print("▶ Preparing for teacher logprob inference...")
+                with timer.time("teacher_logprob_inference_prep"):
+                    teacher_policy.prepare_for_lp_inference()
 
-                    # teacher model forward propagation (need to be implemented separately because of different model sizes)
-                    with torch.no_grad():
-                        teacher_policy.prepare_for_lp_inference()
-                        teacher_logprobs=teacher_policy.get_logprobs(train_data)["logprobs"]
-                        teacher_policy.offload_before_refit()
-                        # Store teacher_logprobs in train_data
-                        train_data["teacher_logprobs"] = teacher_logprobs
-             
+                print("▶ Computing teacher logprobs...")
+                with timer.time("teacher_logprob_inference"):
+                    teacher_topk = teacher_policy.get_topk_logits(train_data, k=master_config["distillation"]["topk_logits_k"])
+                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
-                distillation_safe_data = {}
-                
-                for key, value in train_data.items():
-                    if key in ["teacher_logprobs"]:
-                        distillation_safe_data[key] = value
-                        if len(value.shape) == 3:
-                            batch_size, seq_len, vocab_size = value.shape
-                            flattened_logits = value.view(batch_size * seq_len, vocab_size)
-                            
-                            safe_key = f"distillation_{key}_flattened"
-                            distillation_safe_data[safe_key] = flattened_logits
-                            
-                            distillation_safe_data[f"{safe_key}_shape"] = torch.tensor([batch_size, seq_len, vocab_size])
-                        else:
-                            distillation_safe_data[key] = value
-                    else:
-                        distillation_safe_data[key] = value
+                print("▶ Preparing for logprob inference...")
+                with timer.time("logprob_inference_prep"):
+                    teacher_policy.offload_after_refit()
 
+                print("▶ Preparing for training...")
                 with timer.time("training_prep"):
-                    student_policy.prepare_for_training()  
-                    STUDENT_GENERATION_STALE = True  # *** MARK AS STALE AFTER TRAINING ***
-                
-                worker_required_fields = ["input_ids", "input_lengths", "token_mask", "sample_mask", "teacher_logprobs"]
-                clean_worker_data = {}
-                
-                for field in worker_required_fields:
-                    if field in train_data:
-                        if torch.is_tensor(train_data[field]):
-                            clean_worker_data[field] = train_data[field]
-                
-                worker_train_data = BatchedDataDict[DistillationLossDataDict](clean_worker_data)
+                    teacher_policy.offload_after_refit()
+                    student_policy.prepare_for_training()  # set model train and reload optim to GPU
+                    POLICY_GENERATION_STALE = True
 
+                print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    try:
-                        train_results = student_policy.train(worker_train_data, loss_fn)
-                    except Exception as e:
-                        raise
+                    train_results = student_policy.train(train_data, loss_fn)
 
-                teacher_policy.offload_after_refit()        
-                
-                # build training metrics
-                metrics = {}
-                
-                # Extract loss from train_results
-                if "all_mb_metrics" in train_results and "loss" in train_results["all_mb_metrics"]:
-                    loss_list = train_results["all_mb_metrics"]["loss"]
-                    if isinstance(loss_list, (list, tuple)) and len(loss_list) > 0:
-                        loss = sum(loss_list) / len(loss_list)
-                    else:
-                        loss = loss_list
-                    metrics["loss"] = loss
-                else:
-                    # Fallback if loss is not available
-                    loss = 0.0
-                    metrics["loss"] = loss
-                
-                # add other micro-batch metrics 
-                # correctly handle data type, ensure all values are numeric
-                all_mb_metrics = train_results["all_mb_metrics"].copy()
-                
-                # safely add micro-batch metrics, ensure data type is correct
-                for k, v in all_mb_metrics.items():
-                    if isinstance(v, (list, tuple)):
-                        # if list/tuple, calculate average
-                        if len(v) > 0:
-                            if isinstance(v[0], (int, float)):
-                                metrics[k] = sum(v) / len(v)
-                            elif hasattr(v[0], 'numpy'):
-                                metrics[k] = sum(x.numpy() for x in v) / len(v)
-                            else:
-                                # skip unprocessable type
-                                continue
-                        else:
-                            # empty list, skip
-                            continue
-                    elif isinstance(v, (int, float)):
-                        # use value directly
-                        metrics[k] = v
-                    elif hasattr(v, 'numpy'):
-                        # convert to numpy
-                        metrics[k] = v.numpy()
-                    elif hasattr(v, 'item'):
-                        # convert to Python scalar
-                        metrics[k] = v.item()
-                    else:
-                        # skip unprocessable type
-                        continue
-                
-                # record generation length related metrics
-                if "input_ids" in train_data:
-                    input_lengths = (train_data["input_ids"] != 0).sum(dim=1)
-                    metrics.update({
-                        "avg_input_length": input_lengths.float().mean().item(),
-                        "max_input_length": input_lengths.max().item(),
-                        "min_input_length": input_lengths.min().item(),
-                        "input_length_std": input_lengths.float().std().item(),
-                    })
-                
-                # record current best validation loss (if available)
-                if "val_loss" in distillation_save_state and distillation_save_state["val_loss"] is not None:
-                    current_best_val_loss = distillation_save_state["val_loss"]
-                    metrics["best_val_loss"] = current_best_val_loss
-                
-                # use prefix="train" to record all metrics, avoid duplicate
-                if logger is not None:
-                    logger.log_metrics(metrics, step, prefix="train")
-                    
-                    # print training loss information
-                    print(f"✅ [Training] Step {step}: Loss = {loss:.6f}")
-    
-                step += 1
-                distillation_save_state["step"] = step
-                # use the value in config
-                distillation_save_state["consumed_samples"] += distillation_config.get("num_prompts_per_step", 1)
+                # is_last_step = step + 1 == min(
+                #     master_config["distillation"]["max_num_steps"], len(dataloader)
+                # )
+                is_last_step = step + 1 == master_config["distillation"]["max_num_steps"] 
 
-                
-                # save checkpoint
-                if step % distillation_config["save_steps"] == 0:
-                    try:
+                # Run validation if it's a validation step
+                if val_period > 0 and (step + 1) % val_period == 0:
+                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                        refit_student_generation(
+                            student_policy, student_generation, colocated_inference
+                        )
+                        POLICY_GENERATION_STALE = False
+                    else:
+                        student_generation.prepare_for_generation()
+                    val_metrics, validation_timings = validate(
+                        student_generation,
+                        val_dataloader,
+                        tokenizer,
+                        val_task_to_env,
+                        step=step + 1,
+                        master_config=master_config,
+                    )
+                    student_generation.finish_generation()
+                    logger.log_metrics(
+                        validation_timings, step + 1, prefix="timing/validation"
+                    )
+                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
+
+                ## Checkpointing
+                consumed_samples += master_config["distillation"]["num_prompts_per_step"]
+                timeout.mark_iteration()
+
+                should_save_by_step = (
+                    is_last_step
+                    or (step + 1) % master_config["checkpointing"]["save_period"] == 0
+                )
+                # +1 because step is 0-indexed
+                # Check if timeout-based checkpointing is enabled in config.
+                should_save_by_timeout = timeout.check_save()
+
+                if master_config["checkpointing"]["enabled"] and (
+                    should_save_by_step or should_save_by_timeout
+                ):
+                    student_policy.prepare_for_training()
+
+                    distillation_save_state["step"] = step + 1
+                    if val_metrics is not None:
+                        distillation_save_state["val_reward"] = val_metrics["accuracy"]
+                    elif "val_reward" in distillation_save_state:
+                        del distillation_save_state["val_reward"]
+                    distillation_save_state["consumed_samples"] = consumed_samples
+
+                    if master_config["checkpointing"]["metric_name"] is not None:
+                        if (
+                            master_config["checkpointing"]["metric_name"]
+                            not in distillation_save_state
+                        ):
+                            warnings.warn(
+                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
+                                "Saving most recent k checkpoints instead."
+                            )
+                            master_config["checkpointing"]["metric_name"] = None
+
+                    with timer.time("checkpointing"):
+                        print(f"Saving checkpoint for step {step + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            step, distillation_save_state, master_config
+                            step + 1, distillation_save_state, master_config
                         )
                         student_policy.save_checkpoint(
                             weights_path=os.path.join(checkpoint_path, "policy", "weights"),
-                            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer"),
-                            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+                            optimizer_path=os.path.join(
+                                checkpoint_path, "policy", "optimizer"
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "policy", "tokenizer"
+                            ),
                         )
-                        # save dataloader state
                         torch.save(
-                            train_dataloader.state_dict(),
+                            dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
-                    except Exception as e:
-                        import traceback
-                        traceback.print_exc()
-                
-                if step % distillation_config["eval_steps"] == 0 and val_dataloader is not None:
-                    try:
-                        if NEED_REFIT and STUDENT_GENERATION_STALE:
-                            generation_config = {
-                                'temperature': temperature,
-                                'decoding_method': decoding_method,
-                                'max_length': max_length,
-                            }
-                            refit_student_generation(
-                                student_policy, student_generation, colocated_inference, generation_config=generation_config, master_config=master_config
-                            )
-                            STUDENT_GENERATION_STALE = False
-                        else:
-                            if student_generation is not None:
-                                student_generation.prepare_for_generation()
-                        
-                        val_metrics = validate(
-                            teacher_policy,
-                            student_policy,
-                            student_generation,
-                            val_dataloader,
-                            tokenizer,
-                            loss_fn,
-                            decoding_method,
-                            step + 1,
-                            master_config,
-                            task_to_env,
-                        )
-                        
-                        # 初始化eval_metrics
-                        eval_metrics = {}
-                        
-                        if val_metrics:
-                            for k, v in val_metrics.items():
-                                if len(v) > 0 and k != "loss":
-                                    if isinstance(v, (list, tuple)):
-                                        # if list/tuple, calculate average
-                                        if len(v) > 0:
-                                            if isinstance(v[0], (int, float)):
-                                                eval_metrics[k] = sum(v) / len(v)
-                                            elif hasattr(v[0], 'numpy'):
-                                                eval_metrics[k] = sum(x.numpy() for x in v) / len(v)
-                                            else:
-                                                # skip unprocessable type
-                                                continue
-                                        else:
-                                            # empty list, skip
-                                            continue
-                                    elif isinstance(v, (int, float)):
-                                        # use value directly
-                                        eval_metrics[k] = v
-                                    elif hasattr(v, 'numpy'):
-                                        # convert to numpy
-                                        eval_metrics[k] = v.numpy()
-                                    elif hasattr(v, 'item'):
-                                        # convert to Python scalar
-                                        eval_metrics[k] = v.item()
-                                    else:
-                                        # skip unprocessable type
-                                        continue
-                        
-                        if logger is not None and eval_metrics:
-                            logger.log_metrics(eval_metrics, step, prefix="eval")
-                        if "loss" in eval_metrics:
-                            print(f"✅[Validation] Step {step + 1}: Val Loss = {loss:.6f}")
-                            
-                        if student_generation is not None:
-                            student_generation.finish_generation()
-                    except Exception as e:
-                        import traceback
-                        traceback.print_exc()
-                
-                # log
-                if step % distillation_config["logging_steps"] == 0:
-                    try:
-                        logger.log_metrics({
-                            "step": step,
-                            "consumed_samples": distillation_save_state["consumed_samples"],
-                        }, step)
-                    except Exception as e:
-                        import traceback
-                        traceback.print_exc()
-    
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+
+            # Logging
+            # Log training data
+            log_data = {"content": flat_messages["content"]}
+            # log_data["teacher_logprobs"] = train_data["teacher_logprobs"].tolist()
+            log_data["input_lengths"] = input_lengths.tolist()
+            logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+
+            metrics = {
+                "loss": train_results["loss"].numpy(),
+                "grad_norm": train_results["grad_norm"].numpy(),
+                "mean_prompt_length": repeated_batch["length"].numpy(),
+                "total_num_tokens": input_lengths.numpy(),
+            }
+            metrics.update(train_results["all_mb_metrics"])
+            for k, v in metrics.items():
+                if k in {
+                    "lr",
+                    "wd",
+                    "reward",
+                    "global_valid_seqs",
+                    "global_valid_toks",
+                    "mean_prompt_length",
+                }:
+                    metrics[k] = np.mean(v).item()
+                else:
+                    metrics[k] = np.sum(v).item()
+            metrics.update(rollout_metrics)
+
+            timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
+            # # track example with high token mult prob error above 1.05
+            # if metrics["token_mult_prob_error"] > 1.05:
+            #     logger.log_plot_token_mult_prob_error(
+            #         {
+            #             "prompt_lengths": repeated_batch["length"],
+            #             "full_lengths": input_lengths,
+            #             "generation_logprobs": train_data["generation_logprobs"],
+            #             "prev_logprobs": train_data["prev_logprobs"],
+            #             "token_mask": train_data["token_mask"],
+            #             "sample_mask": train_data["sample_mask"],
+            #         },
+            #         step + 1,
+            #         name="train/token_mult_prob_error_plot_sample",
+            #     )
+
+            print("\n📊 Training Results:")
+
+            print(f"  • Loss: {metrics['loss']:.4f}")
+            print(
+                f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
+            )
+            if "total_flops" in train_results:
+                total_tflops = (
+                    train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+                )
+                num_ranks = train_results["num_ranks"]
+                print(
+                    f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)"
+                )
+                if "theoretical_tflops" in train_results:
+                    theoretical_tflops = train_results["theoretical_tflops"]
+                    print(
+                        f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
+                    )
+                    metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
+
+            print("\n⏱️  Timing:")
+            # Display total time first, separately
+            total_time = timing_metrics.get("total_step_time", 0)
+
+            total_num_gpus = (
+                master_config["cluster"]["num_nodes"]
+                * master_config["cluster"]["gpus_per_node"]
+            )
+            metrics.update(
+                {
+                    "tokens_per_sec_per_gpu": metrics["total_num_tokens"]
+                    / total_time
+                    / total_num_gpus
+                }
+            )
+
+            print(f"  • Total step time: {total_time:.2f}s")
+
+            # Display all other timing metrics
+            for k, v in sorted(
+                timing_metrics.items(), key=lambda item: item[1], reverse=True
+            ):
+                if k != "total_step_time":
+                    percent = (v / total_time * 100) if total_time > 0 else 0
+                    print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
+
+            logger.log_metrics(metrics, step + 1, prefix="train")
+            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+
+            timer.reset()
+            step += 1
+            if step >= max_steps:
+                break
+
+
+def validate(
+    policy_generation: GenerationInterface,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer,
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    step: int,
+    master_config: MasterConfig,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run validation on the validation dataset."""
+    if val_dataloader is None:
+        print("  ⚠️ No validation dataloader provided, skipping validation")
+        return {}, {}
+
+    timer = Timer()
+    with timer.time("total_validation_time"):
+        print(f"▶ Starting validation at step {step}...")
+
+        total_rewards = []
+        total_lengths = []
+        all_message_logs = []  # Collect all message logs
+
+        max_batches = (
+            master_config["distillation"]["max_val_samples"]
+            // master_config["distillation"]["val_batch_size"]
+        )
+        for batch_idx, val_batch in enumerate(val_dataloader):
+            if batch_idx >= max_batches:
+                break
+
+            # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+            # Use async rollouts if vLLM async engine is enabled
+            if _should_use_async_rollouts(master_config):
+                val_batch, gen_metrics = run_async_multi_turn_rollout(
+                    policy_generation,
+                    val_batch,
+                    tokenizer,
+                    val_task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=master_config["distillation"]["max_rollout_turns"],
+                    greedy=False,
+                )
+            else:
+                val_batch, gen_metrics = run_multi_turn_rollout(
+                    policy_generation,
+                    val_batch,
+                    tokenizer,
+                    val_task_to_env,
+                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                    max_rollout_turns=master_config["distillation"]["max_rollout_turns"],
+                    greedy=False,
+                )
+            rewards = val_batch["total_reward"]
+
+            total_rewards.extend(rewards.tolist())
+            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+
+            # Collect message logs for later display
+            to_env = [
+                get_keys_from_message_log(
+                    val_batch["message_log"][i], ["role", "content"]
+                )
+                for i in range(len(val_batch["message_log"]))
+            ]
+
+            all_message_logs.extend(to_env)
+
+        # Calculate validation metrics
+        accuracy = sum(total_rewards) / len(total_rewards)
+        avg_length = sum(total_lengths) / len(total_lengths)
+
+        val_metrics = {
+            "accuracy": accuracy,
+            "avg_length": avg_length,
+        }
+
+        # Print sample conversations only once at the end of validation
+        try:
+            print_message_log_samples(
+                all_message_logs,
+                total_rewards,
+                num_samples=min(
+                    master_config["logger"]["num_val_samples_to_print"],
+                    len(all_message_logs),
+                ),
+                step=step,
+            )
+        except Exception as e:
+            print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
+            print("  ⚠️ Continuing validation without displaying samples...")
+
+    # Get timing metrics
+    timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+    validation_time = timing_metrics.get("total_validation_time", 0)
+
+    # Print summary of validation results
+    print("\n📊 Validation Results:")
+    print(f"    • Accuracy: {accuracy:.4f}")
+    print(f"    • Average response length: {avg_length:.1f} tokens")
+    print(f"    • Samples processed: {len(total_rewards)}")
+
+    # Print timing information
+    print("\n  ⏱️  Validation Timing:")
+    validation_time = timing_metrics.get("total_validation_time", 0)
+    print(f"    • Total validation time: {validation_time:.2f}s")
+
+    # Make sure to reset the timer after validation
+    timer.reset()
+
+    return val_metrics, timing_metrics
