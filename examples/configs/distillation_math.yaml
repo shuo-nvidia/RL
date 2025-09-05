@@ -55,11 +55,7 @@ policy: &POLICY_BASE
         sequence_length_round: 64
 
     sequence_packing:
-<<<<<<< HEAD
         enabled: false
-=======
-        enabled: True # TODO: still has bug with sequence packing
->>>>>>> origin/feat-distillation
         train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
         logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
         algorithm: "modified_first_fit_decreasing"
@@ -110,10 +106,7 @@ policy: &POLICY_BASE
             precision: ${...precision}
             tensor_parallel_size: 1
             pipeline_parallel_size: 1
-<<<<<<< HEAD
             enable_expert_parallel: false
-=======
->>>>>>> origin/feat-distillation
             gpu_memory_utilization: 0.6
             max_model_len: ${...max_total_sequence_length} # refer to local policy/teacher config
             enforce_eager: False
