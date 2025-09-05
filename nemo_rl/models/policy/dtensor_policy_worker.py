@@ -54,7 +54,10 @@ from nemo_rl.models.dtensor.parallelize import (
     get_grad_norm,
     to_local_if_dtensor,
 )
-from nemo_rl.distributed.model_utils import distributed_vocab_topk
+from nemo_rl.distributed.model_utils import (
+    distributed_vocab_topk, 
+    allgather_cp_sharded_tensor)
+
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -78,7 +81,6 @@ from nemo_rl.utils.native_checkpoint import (
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-
 
 @contextmanager
 def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
@@ -793,6 +795,7 @@ class DTensorPolicyWorker:
                             mb,
                             global_valid_seqs,
                             global_valid_toks,
+                            context_parallel_group=self.cp_mesh.get_group() if self.cp_size > 1 else None,
                         )
                         del logits
 
@@ -1183,22 +1186,26 @@ class DTensorPolicyWorker:
         k: int,
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[Any]:
-        """Return per-position top-k logits and global indices (no CP/packed support).
+        """Return per-position top-k logits and global indices.
 
         Notes:
         - Operates on logits[:, :-1, :] so that positions align with next-token targets.
         - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
+        - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
-        #assert not self.enable_seq_packing, "get_topk_logits: sequence packing is not supported in this method"
-        assert self.cp_size == 1, "get_topk_logits: context parallel is not supported in this method"
 
-        batch_size_total = data.get("input_ids").shape[0]
-        seq_dim_size = data.get("input_ids").shape[1]
+        topk_batch_size = (
+            micro_batch_size if micro_batch_size is not None else self.cfg["logprob_batch_size"]
+        )
+        #logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
-        self.model.eval()
+        sequence_dim = 1
+        seq_dim_size = data.get("input_ids").shape[sequence_dim]
+
         out_topk_vals = []
         out_topk_idx = []
+        self.model.eval()
 
         with unshard_fsdp2_model(self.model), torch.no_grad():
             data.to("cuda")
@@ -1225,11 +1232,9 @@ class DTensorPolicyWorker:
                     itertools.cycle(dummy_iterator), dummy_batch_ct
                 )
             else:
-                topk_batch_size = (
-                    micro_batch_size if micro_batch_size is not None else self.cfg["logprob_batch_size"]
-                )
                 mb_iterator = data.make_microbatch_iterator(topk_batch_size)
                 iterator_len = data.size // topk_batch_size
+                
             for batch_idx, lp_batch in enumerate(
                 itertools.chain(mb_iterator, dummy_iterator)
                 ):
@@ -1274,41 +1279,167 @@ class DTensorPolicyWorker:
                     flash_attn_kwargs = {}
 
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
-                    model_args = dict(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        use_cache=False,
-                        flash_attn_kwargs=flash_attn_kwargs,
-                        **vlm_kwargs,
+                    attention_mask_input_all_ones = torch.ones(
+                        (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
-                    if len(vlm_kwargs) > 0:
-                        del model_args["flash_attn_kwargs"]
+
+                # if there are multimodal kwargs, we don't need to add position_ids (computed internally)
+                if len(vlm_kwargs) > 0:
+                    position_ids = None
+
+                context_parallel_ctx = None
+                if self.cp_size > 1:
+                    assert len(vlm_kwargs) == 0, (
+                        "multimodal kwargs are not supported for context parallel"
+                    )
+                    seq_index = torch.arange(seq_len, device=input_ids.device).repeat(
+                        1, 1
+                    )
+                    cp_buffers = [input_ids, position_ids, seq_index]
+
+                    # Create context parallel context
+                    context_parallel_ctx = self.create_context_parallel_ctx(
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=cp_buffers,
+                        cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                        cp_no_restore_buffers=set(cp_buffers),
+                    )
+
+                with DTensorPolicyWorker.train_context(context_parallel_ctx):
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        model_args = dict(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask_input_all_ones,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            flash_attn_kwargs=flash_attn_kwargs,
+                            **vlm_kwargs,
+                        )
+                        if len(vlm_kwargs) > 0:
+                            del model_args["flash_attn_kwargs"]
+                        
+                        outputs = self.model(**model_args)
+
+                    logits = outputs.logits  # [B, S, V] or DTensor sharded on V
+                    # IMPORTANT: do not apply generation temperature scaling here for teacher top-k
+
+                    if self.cp_size > 1:
+                        seq_index_tensor = (
+                            DTensor.from_local(
+                                seq_index,
+                                device_mesh=self.cp_mesh,
+                                placements=[Shard(1)],
+                            )
+                            .full_tensor()
+                            .squeeze(0)
+                        )
+
+                        if isinstance(logits, DTensor):
+                            # Must be tp sharded
+                            assert (
+                                logits.device_mesh.ndim == 1
+                                and logits.device_mesh.mesh_dim_names[0] == "tp"
+                            ), "logits must be tp sharded"
+
+                            # CP is implicitly sharded on the seq dim, so we need to redistribute to the tp dim
+                            logits = DTensor.from_local(
+                                logits.to_local(),
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+                        else:
+                            logits = DTensor.from_local(
+                                logits,
+                                device_mesh=self.device_mesh[("cp", "tp")],
+                                placements=[Shard(sequence_dim), Shard(-1)],
+                            )
+ 
+                        # deal with TP first
+                        local_logits = logits.to_local()  # [B, S_cp, V_tp]
+                        
+                        tp_group = self.tp_mesh.get_group()
+                        tp_rank = torch.distributed.get_rank(tp_group)
+                        V_local = int(local_logits.shape[-1])
+                        vocab_start_index = tp_rank * V_local
+                        vocab_end_index = (tp_rank + 1) * V_local
+                        
+                        vals, idx = distributed_vocab_topk(
+                            local_logits,
+                            k=k,
+                            tp_group=tp_group,
+                            vocab_start_index=vocab_start_index,
+                            vocab_end_index=vocab_end_index,
+                        )
+                        # [B, S_cp, k]
+
+                        cp_group = self.cp_mesh.get_group()
+                        
+                        vals = allgather_cp_sharded_tensor(
+                            vals, cp_group, seq_dim=sequence_dim
+                        )
+                        idx = allgather_cp_sharded_tensor(
+                            idx, cp_group, seq_dim=sequence_dim
+                        )
+                        # [B, S, k]
+                    else:
+                        # Compute top-k over full sequence length (do not drop last position)
+                        if isinstance(logits, DTensor):
+                            local_logits = logits.to_local()  # [B, S, V_local]
+                            tp_group = self.tp_mesh.get_group()
+                            tp_rank = torch.distributed.get_rank(tp_group)
+                            V_local = int(local_logits.shape[-1])
+                            vocab_start_index = tp_rank * V_local
+                            vocab_end_index = (tp_rank + 1) * V_local
+
+                            vals, idx = distributed_vocab_topk(
+                                local_logits[:, :, :],
+                                k=k,
+                                tp_group=tp_group,
+                                vocab_start_index=vocab_start_index,
+                                vocab_end_index=vocab_end_index,
+                            )
+                        else:
+                            full_logits = logits.to(torch.float32)
+                            vals, idx = torch.topk(full_logits[:, :, :], k=k, dim=-1)
+
+                # Handle sequence packing unpacking
+                if self.enable_seq_packing:
+                    # Unpack top-k results from packed format back to original batch format
+                    # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
+                    # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
                     
-                    outputs = self.model(**model_args)
-
-                logits = outputs.logits  # [B, S, V] or DTensor sharded on V
-                # IMPORTANT: do not apply generation temperature scaling here for teacher top-k
-
-                # Compute top-k over full sequence length (do not drop last position)
-                if isinstance(logits, DTensor):
-                    local_logits = logits.to_local()  # [B, S, V_local]
-                    tp_group = self.tp_mesh.get_group()
-                    tp_rank = torch.distributed.get_rank(tp_group)
-                    V_local = int(local_logits.shape[-1])
-                    vocab_start_index = tp_rank * V_local
-                    vocab_end_index = (tp_rank + 1) * V_local
-
-                    vals, idx = distributed_vocab_topk(
-                        local_logits[:, :, :],
-                        k=k,
-                        tp_group=tp_group,
-                        vocab_start_index=vocab_start_index,
-                        vocab_end_index=vocab_end_index,
+                    # Create tensors to store unpacked results
+                    unpacked_vals = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=vals.dtype,
+                        device=vals.device,
                     )
-                else:
-                    full_logits = logits.to(torch.float32)
-                    vals, idx = torch.topk(full_logits[:, :, :], k=k, dim=-1)
+                    unpacked_idx = torch.zeros(
+                        (original_batch_size, original_seq_len, k),
+                        dtype=idx.dtype,
+                        device=idx.device,
+                    )
+                    
+                    # Get cumulative sequence lengths for unpacking
+                    cu_seqlens = flash_attn_kwargs.cu_seqlens_q
+                    
+                    for i in range(original_batch_size):
+                        start = cu_seqlens[i].item()
+                        end = cu_seqlens[i + 1].item()
+                        seq_len_actual = input_lengths[i].item()
+                        
+                        # Extract the corresponding portion from packed results
+                        # Note: vals and idx are [1, packed_seq_len, k] due to packing
+                        unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
+                        unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
+                    
+                    # Replace with unpacked results
+                    vals = unpacked_vals
+                    idx = unpacked_idx
+                    
+                    # Update batch_size and seq_len for consistency
+                    batch_size = original_batch_size
+                    seq_len = original_seq_len
 
                 # Handle sequence packing unpacking
                 if self.enable_seq_packing:
@@ -1716,4 +1847,3 @@ class DTensorPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
-
