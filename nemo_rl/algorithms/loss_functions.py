@@ -908,7 +908,6 @@ class DistillationLossFn(LossFunction):
         else:
             teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
         
-
         if cp_size>1:
             teacher_topk_logits = teacher_topk_logits[:, :-1, :]
             student_topk_logits = student_topk_logits[:, :-1, :]
@@ -927,6 +926,7 @@ class DistillationLossFn(LossFunction):
         
         student_probs = student_log_probs.exp() # [B, S-1, k]
         teacher_probs = teacher_log_probs.exp() # [B, S-1, k]
+
         if self.zero_outside_topk and kl_type != "forward":
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
             del H_all
