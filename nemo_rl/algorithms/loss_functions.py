@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional, TypedDict, TypeVar, NotRequired
+from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
-import torch.distributed
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.utils import (
@@ -24,13 +23,9 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
-    gather_logits_at_global_indices,
-    _get_tokens_on_this_cp_rank,
-    allgather_cp_sharded_tensor
-    
-)
-from nemo_rl.models.dtensor.parallelize import (
     get_logprobs_from_vocab_parallel_logits,
+    compute_global_exp_logits_and_max,
+    gather_logits_at_global_indices,
 )
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -936,6 +931,21 @@ class DistillationLossFn(LossFunction):
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
             )
+            if self.zero_outside_topk:
+                # Compute global softmax for student_topk_logits
+                global_exp_logits, global_max_logits, H_all= compute_global_exp_logits_and_max(
+                    local_student_logits,
+                    tp_group=tp_group,
+                    cp_group=cp_group,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_end_index,
+                )
+                
+                # Compute student_topk_logprobs using global softmax normalization
+                # student_topk_logits: [B, S, k], global_max_logits: [B, S], global_exp_logits: [B, S]
+                # Global softmax: exp(x - global_max) / global_sum_exp
+                student_topk_logprobs = (student_topk_logits - global_max_logits.unsqueeze(-1)) - torch.log(global_exp_logits.unsqueeze(-1))
+
         else:
             if self.zero_outside_topk:
                 student_logprobs = torch.nn.functional.log_softmax(student_logits_trimmed, dim=-1)
@@ -945,6 +955,7 @@ class DistillationLossFn(LossFunction):
                 if kl_type != "forward":
                     H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
                     # The entropy of the student probs [B, S-1]
+                del student_logprobs
             else:
                 student_topk_logits = student_logits_trimmed.gather(
                     dim=-1, index=teacher_topk_indices.to(student_logits_trimmed.device)

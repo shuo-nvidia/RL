@@ -843,3 +843,105 @@ def gather_logits_at_global_indices(
             gathered_logits = gathered_logits[:, :-pad_len, :]
     
     return gathered_logits
+
+
+def compute_global_exp_logits_and_max(
+    vocab_parallel_logits: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    vocab_start_index: int,
+    vocab_end_index: int,
+    chunk_size: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute global exp(logits) and max(logits) under TP+CP sharding.
+
+    Differentiable w.r.t. vocab_parallel_logits.
+
+    Args:
+        vocab_parallel_logits: [B, S_cp, V_local] where S_cp is CP sharded sequence length
+        tp_group: tensor-parallel process group
+        vocab_start_index: global vocab start for this rank (inclusive)
+        vocab_end_index: global vocab end for this rank (exclusive)
+        chunk_size: optional chunk along sequence dim to bound memory
+        cp_group: context-parallel process group
+
+    Returns:
+        global_exp_logits: [B, S_full] - sum of [exp(logits) - max(logits)] across all vocab shards
+        global_max_logits: [B, S_full] - max of logits across all vocab shards
+        H_global: [B, S_full] - global ectropy
+    """
+    # CP support: get CP group and size
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    logits = vocab_parallel_logits.to(dtype=torch.float32)
+    B, S, V_local = logits.shape
+    chunk_size = S if chunk_size is None else chunk_size
+
+    all_local_maxes = []
+    for s0 in range(0, S, chunk_size):
+        s1 = min(S, s0 + chunk_size)
+        logits_chunk = logits[:, s0:s1, :]
+        local_max_chunk = torch.max(logits_chunk, dim=-1, keepdim=True)[0]  # [B, chunk, 1]
+        all_local_maxes.append(local_max_chunk)
+    
+    local_max = torch.cat(all_local_maxes, dim=1)  # [B, S, 1]
+    torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+    
+    if cp_size > 1:
+        global_max_logits = allgather_cp_sharded_tensor(local_max, cp_group, seq_dim=1).squeeze(-1)  # [B, S_full]
+    else:
+        global_max_logits = local_max.squeeze(-1)  # [B, S]
+
+
+    exp_logits_chunks = []
+    for s0 in range(0, S, chunk_size):
+        s1 = min(S, s0 + chunk_size)
+        logits_chunk = logits[:, s0:s1, :]  # [B, chunk, V_local]
+        chunk_global_max = global_max_logits[:, s0:s1].unsqueeze(-1)  # [B, chunk, 1]
+        logits_shifted = logits_chunk - chunk_global_max  
+        exp_logits_chunk = torch.exp(logits_shifted)
+        exp_logits_sum = torch.sum(exp_logits_chunk, dim=-1, keepdim=True)  # [B, chunk, 1]
+        exp_logits_chunks.append(exp_logits_sum)
+    
+    local_exp_sum = torch.cat(exp_logits_chunks, dim=1)  # [B, S, 1]
+    torch.distributed.all_reduce(local_exp_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    
+    if cp_size > 1:
+        global_exp_logits = allgather_cp_sharded_tensor(local_exp_sum, cp_group, seq_dim=1).squeeze(-1)  # [B, S_full]
+    else:
+        global_exp_logits = local_exp_sum.squeeze(-1)  # [B, S]
+
+
+    log_global_exp = torch.log(global_exp_logits + 1e-10)  # [B, S_full] 
+    
+    entropy_chunks = []
+    for s0 in range(0, S, chunk_size):
+        s1 = min(S, s0 + chunk_size)
+        logits_chunk = logits[:, s0:s1, :]  # [B, chunk, V_local]
+        
+        chunk_global_max = global_max_logits[:, s0:s1].unsqueeze(-1)  # [B, chunk, 1]
+        chunk_log_z = log_global_exp[:, s0:s1].unsqueeze(-1)  # [B, chunk, 1]
+        
+        shifted = logits_chunk - chunk_global_max  # [B, chunk, V_local]
+        
+        exp_shifted = torch.exp(shifted) 
+        term = exp_shifted * (shifted - chunk_log_z)  # [B, chunk, V_local]
+        
+        sum_term = torch.sum(term, dim=-1, keepdim=True)  # [B, chunk, 1]
+        entropy_chunks.append(sum_term)
+    
+    local_entropy_sum = torch.cat(entropy_chunks, dim=1)  # [B, S, 1]
+    torch.distributed.all_reduce(local_entropy_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    
+    # H = sum_term / Z
+
+    global_exp_unsqueezed = global_exp_logits.unsqueeze(-1) + 1e-10  # avoid 0
+    local_h = local_entropy_sum / global_exp_unsqueezed  # [B, S, 1]
+    
+    # [B, S_full]
+    if cp_size > 1:
+        H_global = allgather_cp_sharded_tensor(local_h, cp_group, seq_dim=1).squeeze(-1)  # [B, S_full]
+    else:
+        H_global = local_h.squeeze(-1)  # [B, S]
+
+    return global_exp_logits, global_max_logits, H_global
