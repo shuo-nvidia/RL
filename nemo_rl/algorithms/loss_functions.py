@@ -25,8 +25,6 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     gather_logits_at_global_indices,
-)
-from nemo_rl.models.dtensor.parallelize import (
     get_logprobs_from_vocab_parallel_logits,
 )
 
