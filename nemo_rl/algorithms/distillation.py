@@ -16,10 +16,12 @@ import warnings
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
-import torch
 import numpy as np
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
 from nemo_rl.algorithms.loss_functions import (
     DistillationLossConfig,
     DistillationLossDataDict,
@@ -29,17 +31,22 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import (
+    batched_message_log_to_flat_message,
+    get_keys_from_message_log,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
 )
+from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.rollouts import (
+    run_async_multi_turn_rollout,
+    run_multi_turn_rollout,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
-)
-from nemo_rl.data.llm_message_utils import (
-    batched_message_log_to_flat_message,
-    get_keys_from_message_log,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -51,11 +58,8 @@ from nemo_rl.utils.logger import (
     LoggerConfig,
     print_message_log_samples,
 )
-from nemo_rl.utils.timer import Timer, TimeoutChecker
-from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.experience.rollouts import run_multi_turn_rollout, run_async_multi_turn_rollout
-from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 # ===============================================================================
 # Configuration
@@ -67,7 +71,7 @@ class DistillationConfig(TypedDict):
     # Training configuration
     num_prompts_per_step: int
     num_generations_per_prompt: int
-    max_rollout_turns: int # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+    max_rollout_turns: int  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     max_num_steps: int
     val_batch_size: int
     val_period: int
@@ -76,29 +80,34 @@ class DistillationConfig(TypedDict):
     topk_logits_k: int
     seed: int
 
+
 class DistillationSaveState(TypedDict):
     step: int
-    val_reward: NotRequired[float]    # Can be any metric. Setted to 'accuracy' by default in validation.
+    val_reward: NotRequired[
+        float
+    ]  # Can be any metric. Setted to 'accuracy' by default in validation.
     consumed_samples: int
 
 
 def _default_distillation_save_state() -> DistillationSaveState:
     return {
         "step": 0,
-        "val_reward": -99999999.0,    # Aligned with GRPO
+        "val_reward": -99999999.0,  # Aligned with GRPO
         "consumed_samples": 0,
     }
 
+
 class MasterConfig(TypedDict):
-    """Main configuration structure"""
-    policy: PolicyConfig             # Student model configuration
-    teacher: PolicyConfig            # Teacher model configuration
+    """Main configuration structure."""
+
+    policy: PolicyConfig  # Student model configuration
+    teacher: PolicyConfig  # Teacher model configuration
     loss_fn: DistillationLossConfig  # Loss function configuration
-    env: dict[str, Any]              # Environment configuration
-    data: DataConfig                 # Data configuration
-    distillation: DistillationConfig    # Distillation configuration
-    logger: LoggerConfig                # Logger configuration
-    cluster: ClusterConfig              # Cluster configuration
+    env: dict[str, Any]  # Environment configuration
+    data: DataConfig  # Data configuration
+    distillation: DistillationConfig  # Distillation configuration
+    logger: LoggerConfig  # Logger configuration
+    cluster: ClusterConfig  # Cluster configuration
     checkpointing: CheckpointingConfig  # Checkpointing configuration
 
 
@@ -112,22 +121,22 @@ def setup(
     train_dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
-    ColocatablePolicyInterface,     # student_policy
+    ColocatablePolicyInterface,  # student_policy
     Optional[GenerationInterface],  # student_generation
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    TokenizerType,                  # tokenizer
+    TokenizerType,  # tokenizer
     DistillationLossFn,
     Logger,
     CheckpointManager,
     DistillationSaveState,
     MasterConfig,
 ]:
-    """Main entry point for distillation algorithm
-    
+    """Main entry point for distillation algorithm.
+
     Returns:
-        tuple of student_policy, student_generation, 
-        (train_cluster, inference_cluster), train_dataloader, val_dataloader, 
+        tuple of student_policy, student_generation,
+        (train_cluster, inference_cluster), train_dataloader, val_dataloader,
         loss_fn, logger, checkpointer, distillation_save_state, master_config
     """
     # Extract configuration
@@ -143,12 +152,12 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
-    assert (                     
-        not loss_config.get("zero_outside_topk", False) 
-        or (policy_config["dtensor_cfg"]["context_parallel_size"] == 1)
+    assert (  # [TODO] we may support this for tp in the future
+        not loss_config.get("zero_outside_topk", False)
+        or (policy_config["dtensor_cfg"]["tensor_parallel_size"] == 1)
     ), (
-        f"zero_outside_topk=True requires context_parallel_size=1, "
-        f"but got context_parallel_size={policy_config['dtensor_cfg']['context_parallel_size']}. "
+        f"zero_outside_topk=True requires tensor_parallel_size=1, "
+        f"but got tensor_parallel_size={policy_config['dtensor_cfg']['tensor_parallel_size']}. "
     )
     # Set random seed
     set_seed(distillation_config["seed"])
@@ -165,8 +174,8 @@ def setup(
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     distillation_save_state: Optional[DistillationSaveState] = cast(
-        Optional[DistillationSaveState], 
-        checkpointer.load_training_info(last_checkpoint_path)
+        Optional[DistillationSaveState],
+        checkpointer.load_training_info(last_checkpoint_path),
     )
     if distillation_save_state is None:
         distillation_save_state = _default_distillation_save_state()
@@ -176,12 +185,11 @@ def setup(
     # ==========================
     dataloader = StatefulDataLoader(
         train_dataset,
-        batch_size=distillation_config["num_prompts_per_step"],  
+        batch_size=distillation_config["num_prompts_per_step"],
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
     )
-    
     if last_checkpoint_path:
         dataloader_state_dict = torch.load(
             os.path.join(last_checkpoint_path, "train_dataloader.pt")
@@ -199,7 +207,7 @@ def setup(
         )
         val_dataloader = StatefulDataLoader(
             val_dataset,
-            batch_size=distillation_config["val_batch_size"],  
+            batch_size=distillation_config["val_batch_size"],
             shuffle=False,
             collate_fn=rl_collate_fn,
         )
@@ -215,7 +223,7 @@ def setup(
         cluster = RayVirtualCluster(
             name="distillation_cluster",
             bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-             * cluster_config["num_nodes"],
+            * cluster_config["num_nodes"],
             use_gpus=True,
             num_gpus_per_node=cluster_config["gpus_per_node"],
             max_colocated_worker_groups=1
@@ -225,7 +233,6 @@ def setup(
         train_cluster = cluster
         inference_cluster = cluster
         print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
-    
     else:
         assert generation_config["backend"] != "megatron", (
             "Non-colocated inference is not supported for Megatron generation backends. "
@@ -291,7 +298,6 @@ def setup(
     #      Student Policy
     # ==========================
     print("\n▶ Setting up models...")
-    
     # Checkpoint paths
     if last_checkpoint_path:
         weights_path = Path(last_checkpoint_path) / "policy" / "weights"
@@ -302,33 +308,32 @@ def setup(
 
     student_policy = Policy(
         name_prefix="student",
-        cluster=train_cluster,  
+        cluster=train_cluster,
         config=policy_config,
         tokenizer=tokenizer,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,
-        init_reference_model=False,  
+        init_reference_model=False,
     )
 
     # ==========================
     #      Teacher Policy
     # ==========================
     print("\n▶ Setting up models...")
-    
     # Checkpoint paths
     weights_path = None
     optimizer_path = None
 
     teacher_policy = Policy(
         name_prefix="teacher",
-        cluster=train_cluster,  
+        cluster=train_cluster,
         config=teacher_config,
         tokenizer=tokenizer,
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=False,
-        init_reference_model=False,  
+        init_reference_model=False,
     )
 
     # ==========================
@@ -353,7 +358,6 @@ def setup(
         state_dict_info = student_policy.prepare_refit_info()
         student_generation.prepare_refit_info(state_dict_info)
 
-
     loss_fn = DistillationLossFn(loss_config)
 
     print("\n" + "=" * 60)
@@ -366,7 +370,7 @@ def setup(
         student_generation,
         dataloader,
         val_dataloader,
-        #tokenizer,  
+        # tokenizer,
         loss_fn,
         logger,
         checkpointer,
@@ -422,7 +426,9 @@ def distillation_train(
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(student_policy, student_generation, colocated_inference)
+            refit_policy_generation(
+                student_policy, student_generation, colocated_inference
+            )
             POLICY_GENERATION_STALE = False
         else:
             student_generation.prepare_for_generation()
@@ -444,9 +450,7 @@ def distillation_train(
 
     while step < max_steps:
         for batch in dataloader:
-            print(
-                f"\n{'=' * 25} Step {step + 1}/{max_steps} {'=' * 25}"
-            )
+            print(f"\n{'=' * 25} Step {step + 1}/{max_steps} {'=' * 25}")
             maybe_gpu_profile_step(student_policy, step + 1)
             if student_policy != student_generation:
                 maybe_gpu_profile_step(student_generation, step + 1)
@@ -457,24 +461,31 @@ def distillation_train(
                 print("▶ Preparing batch...")
                 with timer.time("data_processing"):
                     # Repeat batch items
-                    repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(
-                        master_config["distillation"]["num_generations_per_prompt"]
+                    repeated_batch: BatchedDataDict[DatumSpec] = (
+                        batch.repeat_interleave(
+                            master_config["distillation"]["num_generations_per_prompt"]
+                        )
                     )
-        
-                    ''' # not used in distillation
+
+                    """ # not used in distillation
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
-                    input_ids = batched_flat["token_ids"] 
-                    '''
+                    input_ids = batched_flat["token_ids"]
+                    """
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
-                print(f"▶ Generating responses for batch of size {repeated_batch.size}...")
+                print(
+                    f"▶ Generating responses for batch of size {repeated_batch.size}..."
+                )
                 with timer.time("prepare_for_generation"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            student_policy, student_generation, colocated_inference, timer=timer
+                            student_policy,
+                            student_generation,
+                            colocated_inference,
+                            timer=timer,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -494,7 +505,9 @@ def distillation_train(
                             max_seq_len=master_config["policy"][
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config["distillation"]["max_rollout_turns"],
+                            max_rollout_turns=master_config["distillation"][
+                                "max_rollout_turns"
+                            ],
                             greedy=False,
                         )
                     else:
@@ -506,7 +519,9 @@ def distillation_train(
                             max_seq_len=master_config["policy"][
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config["distillation"]["max_rollout_turns"],
+                            max_rollout_turns=master_config["distillation"][
+                                "max_rollout_turns"
+                            ],
                             greedy=False,
                         )
                     student_generation.finish_generation()
@@ -524,12 +539,12 @@ def distillation_train(
                                     message["token_ids"]
                                 )
                             # TODO: we may use this to sample top k from student model's logits
-                            '''
+                            """
                             if "generation_logprobs" not in message:
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
-                            '''
+                            """
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -550,7 +565,9 @@ def distillation_train(
                         }
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    train_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+                    train_data.update(
+                        flat_messages.get_multimodal_dict(as_tensors=False)
+                    )
                     train_data.to("cpu")
 
                 print("▶ Preparing for teacher logprob inference...")
@@ -559,7 +576,9 @@ def distillation_train(
 
                 print("▶ Computing teacher logprobs...")
                 with timer.time("teacher_logprob_inference"):
-                    teacher_topk = teacher_policy.get_topk_logits(train_data, k=master_config["distillation"]["topk_logits_k"])
+                    teacher_topk = teacher_policy.get_topk_logits(
+                        train_data, k=master_config["distillation"]["topk_logits_k"]
+                    )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
@@ -577,7 +596,9 @@ def distillation_train(
                 with timer.time("policy_training"):
                     train_results = student_policy.train(train_data, loss_fn)
 
-                is_last_step = step + 1 == master_config["distillation"]["max_num_steps"] 
+                is_last_step = (
+                    step + 1 == master_config["distillation"]["max_num_steps"]
+                )
 
                 # Run validation if it's a validation step
                 if val_period > 0 and (step + 1) % val_period == 0:
@@ -603,7 +624,9 @@ def distillation_train(
                     logger.log_metrics(val_metrics, step + 1, prefix="validation")
 
                 ## Checkpointing
-                consumed_samples += master_config["distillation"]["num_prompts_per_step"]
+                consumed_samples += master_config["distillation"][
+                    "num_prompts_per_step"
+                ]
                 timeout.mark_iteration()
 
                 should_save_by_step = (
@@ -643,7 +666,9 @@ def distillation_train(
                             step + 1, distillation_save_state, master_config
                         )
                         student_policy.save_checkpoint(
-                            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+                            weights_path=os.path.join(
+                                checkpoint_path, "policy", "weights"
+                            ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
                             ),
@@ -683,7 +708,9 @@ def distillation_train(
                     metrics[k] = np.sum(v).item()
             metrics.update(rollout_metrics)
 
-            timing_metrics: dict[str, float] = timer.get_timing_metrics(reduction_op="sum")  # type: ignore
+            timing_metrics: dict[str, float] = timer.get_timing_metrics(
+                reduction_op="sum"
+            )  # type: ignore
 
             print("\n📊 Training Results:")
 
@@ -693,7 +720,9 @@ def distillation_train(
             )
             if "total_flops" in train_results:
                 total_tflops = (
-                    train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+                    train_results["total_flops"]
+                    / timing_metrics["policy_training"]
+                    / 1e12
                 )
                 num_ranks = train_results["num_ranks"]
                 print(
@@ -758,7 +787,7 @@ def validate(
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
 
-        total_rewards = []     # Can be any metric. Setted to 'accuracy' by default.
+        total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
@@ -779,7 +808,9 @@ def validate(
                     tokenizer,
                     val_task_to_env,
                     max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"]["max_rollout_turns"],
+                    max_rollout_turns=master_config["distillation"][
+                        "max_rollout_turns"
+                    ],
                     greedy=False,
                 )
             else:
@@ -789,7 +820,9 @@ def validate(
                     tokenizer,
                     val_task_to_env,
                     max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"]["max_rollout_turns"],
+                    max_rollout_turns=master_config["distillation"][
+                        "max_rollout_turns"
+                    ],
                     greedy=False,
                 )
             rewards = val_batch["total_reward"]
@@ -798,7 +831,7 @@ def validate(
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
-            to_env = [  
+            to_env = [
                 get_keys_from_message_log(
                     val_batch["message_log"][i], ["role", "content"]
                 )

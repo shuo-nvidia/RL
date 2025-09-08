@@ -14,7 +14,6 @@
 
 import argparse
 import os
-import pprint
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -25,8 +24,8 @@ from nemo_rl.algorithms.distillation import MasterConfig, distillation_train, se
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
 from nemo_rl.data.hf_datasets.deepscaler import DeepScalerDataset
+from nemo_rl.data.hf_datasets.openmathinstruct2 import OpenMathInstruct2Dataset
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -48,7 +47,9 @@ OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Run distillation training with configuration")
+    parser = argparse.ArgumentParser(
+        description="Run distillation training with configuration"
+    )
     parser.add_argument(
         "--config", type=str, default=None, help="Path to YAML config file"
     )
@@ -73,19 +74,21 @@ def hf_data_processor(
     max_seq_length: int,  # required parameter
     idx: int,
 ) -> DatumSpec:
-    """Process Hugging Face format data into NeMo-RL format"""
+    """Process Hugging Face format data into NeMo-RL format."""
     # safety check: ensure prompt exists
     if task_data_spec.prompt is None:
         if task_data_spec.prompt_file:
             if os.path.exists(task_data_spec.prompt_file):
                 try:
-                    with open(task_data_spec.prompt_file, 'r', encoding='utf-8') as f:
+                    with open(task_data_spec.prompt_file, "r", encoding="utf-8") as f:
                         content = f.read()
                 except Exception as e:
                     raise ValueError(f"Failed to read file: {e}")
             else:
-                raise ValueError(f"Prompt file does not exist: {task_data_spec.prompt_file}")
-        
+                raise ValueError(
+                    f"Prompt file does not exist: {task_data_spec.prompt_file}"
+                )
+
         raise ValueError(
             f"TaskDataSpec.prompt is None. This usually means the prompt file "
             f"'{task_data_spec.prompt_file}' could not be loaded or is empty. "
@@ -98,12 +101,10 @@ def hf_data_processor(
     extra_env_info = {"ground_truth": messages[1]["content"]}
 
     message_log: LLMMessageLogType = []
-    
     try:
         formatted_content = task_data_spec.prompt.format(problem)
     except Exception as e:
         raise ValueError(f"Failed to format prompt: {e}")
-    
     user_message = {
         "role": "user",
         "content": formatted_content,
@@ -237,22 +238,23 @@ def main() -> None:
     init_ray()
 
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    
+
     if config["policy"]["generation"] is not None:
         from nemo_rl.models.generation import configure_generation_config
+
         config["policy"]["generation"] = configure_generation_config(
             config["policy"]["generation"], tokenizer
         )
     else:
-        print(f"  ⚠️ No generation config found, this may cause issues")
-    
+        print("  ⚠️ No generation config found, this may cause issues")
+
     # setup data
     (
         dataset,
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(tokenizer, config["data"], config["env"], 42)  
+    ) = setup_data(tokenizer, config["data"], config["env"], 42)
 
     (
         student_policy,
@@ -260,7 +262,7 @@ def main() -> None:
         student_generation,
         dataloader,
         val_dataloader,
-        #tokenizer,  # add tokenizer
+        # tokenizer,  # add tokenizer
         loss_fn,
         logger,
         checkpointer,
@@ -287,4 +289,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -19,6 +19,7 @@ from typing import Any, Optional, Union
 import numpy as np
 import torch
 import ray
+import torch
 from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 

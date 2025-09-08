@@ -760,7 +760,9 @@ def distributed_vocab_topk(
         vals_chunks.append(sel_vals)
         idx_chunks.append(sel_idx)
 
-    topk_vals = torch.cat(vals_chunks, dim=1) if len(vals_chunks) > 1 else vals_chunks[0]
+    topk_vals = (
+        torch.cat(vals_chunks, dim=1) if len(vals_chunks) > 1 else vals_chunks[0]
+    )
     topk_global_indices = (
         torch.cat(idx_chunks, dim=1) if len(idx_chunks) > 1 else idx_chunks[0]
     )
@@ -796,19 +798,22 @@ def gather_logits_at_global_indices(
     """
     # CP support: get CP group and size
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
-    
     # Handle CP sharding of global_indices (similar to from_parallel_logits_to_logprobs)
     pad_len = 0
     if cp_size > 1:
         # Pad the global_indices to local size * cp_size if needed
         pad_len = vocab_parallel_logits.shape[1] * cp_size - global_indices.shape[1]
         if pad_len > 0:
-            global_indices = torch.nn.functional.pad(global_indices, (0, 0, 0, pad_len), value=0)
-        
+            global_indices = torch.nn.functional.pad(
+                global_indices, (0, 0, 0, pad_len), value=0
+            )
+
         # Shard the global_indices by context parallelism
         cp_rank = torch.distributed.get_rank(cp_group)
-        global_indices = _get_tokens_on_this_cp_rank(global_indices, cp_rank, cp_size, seq_dim=1)
-    
+        global_indices = _get_tokens_on_this_cp_rank(
+            global_indices, cp_rank, cp_size, seq_dim=1
+        )
+
     logits = vocab_parallel_logits.to(dtype=torch.float32)
     B, S, V_local = logits.shape
     if chunk_size is None:
@@ -832,8 +837,10 @@ def gather_logits_at_global_indices(
         )
         out_chunks.append(local_vals)
 
-    gathered_logits = torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
-    
+    gathered_logits = (
+        torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
+    )
+
     # CP gather: gather the logits by context parallelism
     if cp_size > 1:
         gathered_logits = allgather_cp_sharded_tensor(
