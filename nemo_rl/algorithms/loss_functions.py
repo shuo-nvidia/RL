@@ -875,6 +875,13 @@ class DistillationLossFn(LossFunction):
         input_ids = data["input_ids"]
         batch_size = input_ids.shape[0]
 
+        # Validate k > 0 for top-k operations
+        teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
+        teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
+        
+        if teacher_topk_logits.shape[-1] == 0:
+            raise ValueError("k must be greater than 0 for distillation loss. Got k=0 which is invalid for KL divergence calculation.")
+
         # CP support: get CP group and size
         cp_group = context_parallel_group
         cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
@@ -885,8 +892,6 @@ class DistillationLossFn(LossFunction):
         log_infinitesimal = getattr(self, "log_infinitesimal", -23)
         per_token_kl = None
         # Preferred truncated-KL path: teacher provides top-k support per position
-        teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
-        teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
 
         if (
             cp_size > 1
@@ -919,8 +924,10 @@ class DistillationLossFn(LossFunction):
             tp_rank = tp_group.rank()
 
             local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
-            if cp_size > 1:
-                pass
+            if (
+                cp_size > 1
+            ):
+                pass # we will trim the student sequence length after CP aggregation
             else:
                 local_student_logits = local_student_logits[:, :-1, :]
             V_local = int(local_student_logits.shape[-1])
@@ -938,7 +945,7 @@ class DistillationLossFn(LossFunction):
             )
             if self.zero_outside_topk:
                 # Compute global softmax for student_topk_logits
-                global_exp_logits, global_max_logits, H_all= compute_global_exp_logits_and_max(
+                global_sum_exp_logits, global_max_logits, H_all= compute_global_exp_logits_and_max(
                     local_student_logits,
                     tp_group=tp_group,
                     cp_group=cp_group,
@@ -949,7 +956,8 @@ class DistillationLossFn(LossFunction):
                 # Compute student_topk_logprobs using global softmax normalization
                 # student_topk_logits: [B, S, k], global_max_logits: [B, S], global_exp_logits: [B, S]
                 # Global softmax: exp(x - global_max) / global_sum_exp
-                student_topk_logprobs = (student_topk_logits - global_max_logits.unsqueeze(-1)) - torch.log(global_exp_logits.unsqueeze(-1))
+                student_topk_logprobs = (student_topk_logits - global_max_logits.unsqueeze(-1)) \
+                                        - torch.log(global_sum_exp_logits.unsqueeze(-1))
 
         else:
             if self.zero_outside_topk:
