@@ -1211,7 +1211,7 @@ class DTensorPolicyWorker:
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
 
-
+        self.model.eval()
         out_topk_vals = []
         out_topk_idx = []
         self.model.eval()
@@ -1243,9 +1243,7 @@ class DTensorPolicyWorker:
             else:
                 mb_iterator = data.make_microbatch_iterator(topk_batch_size)
                 iterator_len = data.size // topk_batch_size
-
-
-
+                
             for batch_idx, lp_batch in enumerate(
                 itertools.chain(mb_iterator, dummy_iterator)
             ):

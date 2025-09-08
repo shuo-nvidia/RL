@@ -24,15 +24,10 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
-    gather_logits_at_global_indices,
-    _get_tokens_on_this_cp_rank,
-    allgather_cp_sharded_tensor
-    
-)
-from nemo_rl.models.dtensor.parallelize import (
+    gather_logits_at_global_indices,   
     get_logprobs_from_vocab_parallel_logits,
     compute_global_exp_logits_and_max,
-    gather_logits_at_global_indices,
+
 )
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
