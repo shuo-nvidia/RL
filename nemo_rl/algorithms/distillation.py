@@ -153,13 +153,7 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
-    assert (  # [TODO] we may support this for tp in the future
-        not loss_config.get("zero_outside_topk", False)
-        or (policy_config["dtensor_cfg"]["tensor_parallel_size"] == 1)
-    ), (
-        f"zero_outside_topk=True requires tensor_parallel_size=1, "
-        f"but got tensor_parallel_size={policy_config['dtensor_cfg']['tensor_parallel_size']}. "
-    )
+    # zero_outside_topk now supports TP>1 via distributed log-softmax and gather
     # Set random seed
     set_seed(distillation_config["seed"])
 
