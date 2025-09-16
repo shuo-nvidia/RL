@@ -58,10 +58,6 @@ from nemo_rl.models.dtensor.parallelize import (
     get_grad_norm,
     to_local_if_dtensor,
 )
-from nemo_rl.distributed.model_utils import (
-    distributed_vocab_topk, 
-    allgather_cp_sharded_tensor)
-
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -85,6 +81,7 @@ from nemo_rl.utils.native_checkpoint import (
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
 
 @contextmanager
 def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
@@ -1200,7 +1197,6 @@ class DTensorPolicyWorker:
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
-
         topk_batch_size = (
             micro_batch_size
             if micro_batch_size is not None

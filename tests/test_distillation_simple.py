@@ -3,20 +3,18 @@
 简化的distillation测试脚本，用于验证基本功能
 """
 
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from unittest.mock import MagicMock
+
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.distillation import (
-    _default_distillation_save_state,
-    distillation_train,
-    validate,
-)
 from nemo_rl.algorithms.loss_functions import DistillationLossFn
+
 
 def test_basic_imports():
     """测试基本导入是否正常"""

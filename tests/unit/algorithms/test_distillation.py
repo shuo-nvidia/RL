@@ -18,10 +18,14 @@ import pytest
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.distillation import _default_distillation_save_state, distillation_train, validate
+from nemo_rl.algorithms.distillation import (
+    _default_distillation_save_state,
+    distillation_train,
+    validate,
+)
 from nemo_rl.algorithms.loss_functions import DistillationLossFn
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 @pytest.fixture
