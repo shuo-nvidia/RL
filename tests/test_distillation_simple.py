@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-简化的distillation测试脚本，用于验证基本功能
+Simplified distillation test script for verifying basic functionality
 """
 
 import os
@@ -17,13 +17,13 @@ from nemo_rl.algorithms.loss_functions import DistillationLossFn
 
 
 def test_basic_imports():
-    """测试基本导入是否正常"""
-    print("✅ 基本导入测试通过")
+    """Test whether basic imports work"""
+    print("✅ Basic import test passed")
     return True
 
 
 def test_config_creation():
-    """测试配置创建"""
+    """Test config creation"""
     master_config = {
         "distillation": {
             "max_num_steps": 3,
@@ -75,19 +75,19 @@ def test_config_creation():
         },
     }
 
-    # 测试配置访问
+    # Test config access
     assert "distillation" in master_config
     assert "policy" in master_config
     assert "generation" in master_config["policy"]
     assert "colocated" in master_config["policy"]["generation"]
 
-    print("✅ 配置创建测试通过")
+    print("✅ Config creation test passed")
     return True
 
 
 def test_mock_components():
-    """测试mock组件创建"""
-    # 创建mock组件
+    """Test creation of mock components"""
+    # Create mock components
     student_policy = MagicMock()
     student_policy.train.return_value = {
         "loss": torch.tensor(0.5),
@@ -108,7 +108,7 @@ def test_mock_components():
         "topk_indices": torch.randint(0, 8, (2, 10, 64)),
     }
 
-    # 创建mock batch数据
+    # Create mock batch data
     mock_batch = {
         "message_log": [
             [
@@ -134,7 +134,7 @@ def test_mock_components():
         "teacher_topk_indices": torch.randint(0, 8, (2, 10, 64)),
     }
 
-    # 创建mock dataloaders
+    # Create mock dataloaders
     train_dataloader = MagicMock(spec=StatefulDataLoader)
 
     def train_iter(self):
@@ -151,7 +151,7 @@ def test_mock_components():
     val_dataloader.__iter__ = val_iter
     val_dataloader.__len__ = MagicMock(return_value=5)
 
-    # 创建其他mock组件
+    # Create other mock components
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
 
@@ -171,24 +171,24 @@ def test_mock_components():
     task_to_env = {"math": MagicMock()}
     val_task_to_env = {"math": MagicMock()}
 
-    print("✅ Mock组件创建测试通过")
+    print("✅ Mock component creation test passed")
     return True
 
 
 def main():
-    """运行所有测试"""
-    print("开始运行简化的distillation测试...")
+    """Run all tests"""
+    print("Starting simplified distillation tests...")
 
     try:
         test_basic_imports()
         test_config_creation()
         test_mock_components()
 
-        print("\n🎉 所有测试通过！distillation测试配置正确。")
+        print("\n🎉 All tests passed! Distillation test configuration is correct.")
         return 0
 
     except Exception as e:
-        print(f"\n❌ 测试失败: {e}")
+        print(f"\n❌ Test failed: {e}")
         import traceback
 
         traceback.print_exc()
