@@ -191,6 +191,7 @@ def setup(
         collate_fn=rl_collate_fn,
         drop_last=True,
     )
+
     if last_checkpoint_path:
         dataloader_state_dict = torch.load(
             os.path.join(last_checkpoint_path, "train_dataloader.pt")
@@ -299,6 +300,7 @@ def setup(
     #      Student Policy
     # ==========================
     print("\n▶ Setting up models...")
+
     # Checkpoint paths
     if last_checkpoint_path:
         weights_path = Path(last_checkpoint_path) / "policy" / "weights"

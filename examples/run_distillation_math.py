@@ -100,10 +100,12 @@ def hf_data_processor(
     extra_env_info = {"ground_truth": messages[1]["content"]}
 
     message_log: LLMMessageLogType = []
+
     try:
         formatted_content = task_data_spec.prompt.format(problem)
     except Exception as e:
         raise ValueError(f"Failed to format prompt: {e}")
+
     user_message = {
         "role": "user",
         "content": formatted_content,
