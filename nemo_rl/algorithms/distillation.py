@@ -123,10 +123,10 @@ def setup(
     val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
     ColocatablePolicyInterface,  # student_policy
+    ColocatablePolicyInterface,  # teacher_policy
     Optional[GenerationInterface],  # student_generation
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    TokenizerType,  # tokenizer
     DistillationLossFn,
     Logger,
     CheckpointManager,
@@ -137,7 +137,7 @@ def setup(
 
     Returns:
         tuple of student_policy, student_generation,
-        (train_cluster, inference_cluster), train_dataloader, val_dataloader,
+        train_dataloader, val_dataloader,
         loss_fn, logger, checkpointer, distillation_save_state, master_config
     """
     # Extract configuration
@@ -245,31 +245,34 @@ def setup(
 
         # validate and configure resources
         if cluster_config["num_nodes"] == 1:
-            if inference_gpus_per_node is None:
-                inference_gpus_per_node = cluster_config["gpus_per_node"] // 2
-            if inference_nodes is None:
-                inference_nodes = 1
+            assert inference_gpus_per_node > 0, (
+                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+                "when cluster.num_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_gpus_per_node}."
+            )
+            assert inference_nodes is None or inference_nodes == 1, (
+                "policy.generation.colocated.resources.num_nodes must be 1 or set to null "
+                "when cluster.num_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
+            )
+            inference_nodes = 1
+            train_gpus_per_node -= inference_gpus_per_node
         else:
-            if inference_gpus_per_node is None:
-                inference_gpus_per_node = cluster_config["gpus_per_node"]
-            if inference_nodes is None:
-                inference_nodes = cluster_config["num_nodes"] // 2
-
-        # validate resources
-        if inference_gpus_per_node > cluster_config["gpus_per_node"]:
-            raise ValueError(
-                f"Inference GPUs per node ({inference_gpus_per_node}) cannot be greater than "
-                f"total GPUs per node ({cluster_config['gpus_per_node']})"
+            assert inference_nodes > 0, (
+                "policy.generation.colocated.resources.num_nodes must be > 0 "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
             )
-        if inference_nodes > cluster_config["num_nodes"]:
-            raise ValueError(
-                f"Inference nodes ({inference_nodes}) cannot be greater than "
-                f"total nodes ({cluster_config['num_nodes']})"
+            assert (
+                inference_gpus_per_node is None
+                or inference_gpus_per_node == cluster_config["gpus_per_node"]
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be equal to cluster.gpus_per_node or set to null "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got {inference_gpus_per_node}."
             )
-
-        # update train resources
-        train_gpus_per_node = cluster_config["gpus_per_node"] - inference_gpus_per_node
-        train_nodes = cluster_config["num_nodes"] - inference_nodes
+            inference_gpus_per_node = cluster_config["gpus_per_node"]
+            train_nodes -= inference_nodes
 
         # create clusters
         train_cluster = RayVirtualCluster(
@@ -367,7 +370,6 @@ def setup(
         student_generation,
         dataloader,
         val_dataloader,
-        # tokenizer,
         loss_fn,
         logger,
         checkpointer,
@@ -578,10 +580,6 @@ def distillation_train(
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
-
-                print("▶ Preparing for logprob inference...")
-                with timer.time("logprob_inference_prep"):
-                    teacher_policy.offload_after_refit()
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
@@ -838,8 +836,12 @@ def validate(
             all_message_logs.extend(to_env)
 
         # Calculate validation metrics
-        accuracy = sum(total_rewards) / len(total_rewards)
-        avg_length = sum(total_lengths) / len(total_lengths)
+        accuracy = (
+            sum(total_rewards) / len(total_rewards) if len(total_rewards) > 0 else 0
+        )
+        avg_length = (
+            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0
+        )
 
         val_metrics = {
             "accuracy": accuracy,
