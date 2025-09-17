@@ -57,17 +57,31 @@ def mock_components():
 
     # Create a proper message log structure with token_ids (similar to SFT)
     # Use BatchedDataDict instead of regular dict to support repeat_interleave
-    mock_batch = BatchedDataDict[DatumSpec]({
-        "message_log": [[
-            {"token_ids": torch.tensor([1, 2, 3]), "role": "user", "content": "What is 1+1?"},
-            {"token_ids": torch.tensor([4, 5, 6]), "role": "assistant", "content": "The answer is 2."}
-        ]],
-        "loss_multiplier": torch.tensor([1.0]),  # Make it 1D tensor for batch dimension
-        "task_name": ["math"],
-        "extra_env_info": [{}],
-        "length": torch.tensor([6]),  # Make it 1D tensor for batch dimension
-        "idx": torch.tensor([0]),     # Make it 1D tensor for batch dimension
-    })
+    mock_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "token_ids": torch.tensor([1, 2, 3]),
+                        "role": "user",
+                        "content": "What is 1+1?",
+                    },
+                    {
+                        "token_ids": torch.tensor([4, 5, 6]),
+                        "role": "assistant",
+                        "content": "The answer is 2.",
+                    },
+                ]
+            ],
+            "loss_multiplier": torch.tensor(
+                [1.0]
+            ),  # Make it 1D tensor for batch dimension
+            "task_name": ["math"],
+            "extra_env_info": [{}],
+            "length": torch.tensor([6]),  # Make it 1D tensor for batch dimension
+            "idx": torch.tensor([0]),  # Make it 1D tensor for batch dimension
+        }
+    )
 
     # Create mock dataloader with 10 batches that can be iterated multiple times
     train_dataloader = MagicMock(spec=StatefulDataLoader)
@@ -89,13 +103,15 @@ def mock_components():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
 
-    loss_fn = DistillationLossFn({
-        "temperature": 1.0,
-        "alpha": 0.5,
-        "kl_type": "forward",
-        "mixed_kl_weight": 0.5,
-        "zero_outside_topk": False,
-    })
+    loss_fn = DistillationLossFn(
+        {
+            "temperature": 1.0,
+            "alpha": 0.5,
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+        }
+    )
 
     logger = MagicMock()
     checkpointer = MagicMock()

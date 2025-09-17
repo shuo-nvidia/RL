@@ -1239,7 +1239,7 @@ class DTensorPolicyWorker:
             else:
                 mb_iterator = data.make_microbatch_iterator(topk_batch_size)
                 iterator_len = data.size // topk_batch_size
-                
+
             for batch_idx, lp_batch in enumerate(
                 itertools.chain(mb_iterator, dummy_iterator)
             ):
@@ -1427,7 +1427,6 @@ class DTensorPolicyWorker:
                         dtype=idx.dtype,
                         device=idx.device,
                     )
-
 
                     # Get cumulative sequence lengths for unpacking
                     cu_seqlens = flash_attn_kwargs.cu_seqlens_q

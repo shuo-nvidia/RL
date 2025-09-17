@@ -129,7 +129,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 tensor_or_list = PackedTensor.flattened_concat(list_of_tensors)
             elif all(x.ndim == 1 for x in list_of_tensors):
                 tensor_or_list = torch.cat(list_of_tensors)
-            elif isinstance(list_of_tensors[0], torch.Tensor): 
+            elif isinstance(list_of_tensors[0], torch.Tensor):
                 pad_value = pad_value_dict.get(k, 0)
                 # bug出在这里，当train_data中包含3维tensor时，下面的flatten()会错误展平后两个维度。
                 # grpo在调用这个函数时只会传入二维tensor，但是sft和dpo这里还需要检查有无三维特殊情况。

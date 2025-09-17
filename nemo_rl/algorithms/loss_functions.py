@@ -935,12 +935,14 @@ class DistillationLossFn(LossFunction):
             if cp_size > 1:
                 pad_len = logits_tensor.shape[1] * cp_size - indices_local.shape[1]
                 if pad_len > 0:
-                    indices_local = torch.nn.functional.pad(indices_local, (0, 0, 0, pad_len), value=0)
+                    indices_local = torch.nn.functional.pad(
+                        indices_local, (0, 0, 0, pad_len), value=0
+                    )
                 cp_rank = torch.distributed.get_rank(cp_group)
                 indices_local = _get_tokens_on_this_cp_rank(
                     indices_local, cp_rank, cp_size, seq_dim=1
                 )
-            
+
             S_local = int(logits_tensor.shape[1])
             chunk_size = max(1, min(S_local, 1024))
             student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
@@ -952,7 +954,7 @@ class DistillationLossFn(LossFunction):
                 parallel_group,
                 False,
             )
-            
+
             if kl_type != "forward":
                 H_all = ChunkedDistributedEntropy.apply(  # type: ignore
                     logits_tensor,
@@ -960,7 +962,7 @@ class DistillationLossFn(LossFunction):
                     parallel_group,
                     False,
                 )
-            
+
             if cp_size > 1:
                 student_topk_logprobs = allgather_cp_sharded_tensor(
                     student_topk_logprobs, cp_group, seq_dim=1
@@ -1100,4 +1102,3 @@ class DistillationLossFn(LossFunction):
         }
 
         return total_loss, metrics
-        
