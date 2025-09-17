@@ -55,7 +55,7 @@ policy: &POLICY_BASE
         sequence_length_round: 64
 
     sequence_packing:
-        enabled: False # TODO: still has bug with sequence packing
+        enabled: false
         train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
         logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
         algorithm: "modified_first_fit_decreasing"

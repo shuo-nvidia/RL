@@ -235,7 +235,6 @@ def setup(
         train_cluster = cluster
         inference_cluster = cluster
         print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
-
     else:
         assert generation_config["backend"] != "megatron", (
             "Non-colocated inference is not supported for Megatron generation backends. "
@@ -325,7 +324,6 @@ def setup(
     #      Teacher Policy
     # ==========================
     print("\n▶ Setting up models...")
-
     # Checkpoint paths
     weights_path = None
     optimizer_path = None

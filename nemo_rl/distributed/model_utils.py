@@ -255,6 +255,132 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
+class ChunkedDistributedGatherLogprob(torch.autograd.Function):
+    """Compute distributed log-softmax once and gather logprobs at given global indices.
+
+    Forward computes per-chunk distributed log-softmax across TP, gathers selected
+    log probabilities at the provided global indices (shape [B, S, K]), and returns
+    a tensor of shape [B, S, K].
+
+    Backward recomputes per-chunk softmax from logits and applies the gradient rule:
+      dL/dz = -softmax * sum_k(dL/dy_k) + scatter_add(dL/dy_k) over selected indices.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        vocab_parallel_logits: torch.Tensor,  # [B, S, V_local]
+        global_indices: torch.Tensor,  # [B, S, K]
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        B, S, V_local = vocab_parallel_logits.shape
+        num_chunks = (int(S) + chunk_size - 1) // chunk_size
+        out_chunks: list[torch.Tensor] = []
+
+        for chunk_idx in range(num_chunks):
+            s0 = chunk_idx * chunk_size
+            s1 = min(int(S), (chunk_idx + 1) * chunk_size)
+
+            logits = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
+            # distributed log softmax along full vocab
+            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
+
+            gi = global_indices[:, s0:s1, :]
+            in_range = (gi >= int(vocab_start_index)) & (gi < int(vocab_end_index))
+            li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1)
+
+            local_vals = torch.gather(log_probs, dim=-1, index=li)
+            local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
+
+            torch.distributed.all_reduce(
+                local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+
+            out_chunks.append(local_vals)
+
+        out = torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
+
+        if not inference_only:
+            ctx.save_for_backward(vocab_parallel_logits, global_indices)
+            ctx.chunk_size = int(chunk_size)
+            ctx.tp_group = tp_group
+            ctx.vocab_start_index = int(vocab_start_index)
+            ctx.vocab_end_index = int(vocab_end_index)
+
+        return out.contiguous()
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+        grad_output = grad_outputs[0]  # [B, S, K]
+        vocab_parallel_logits, global_indices = ctx.saved_tensors
+        chunk_size: int = ctx.chunk_size
+        tp_group = ctx.tp_group
+        vocab_start_index = ctx.vocab_start_index
+        vocab_end_index = ctx.vocab_end_index
+
+        B, S, V_local = vocab_parallel_logits.shape
+        num_chunks = (int(S) + chunk_size - 1) // chunk_size
+        all_grad_input: list[torch.Tensor] = []
+
+        for chunk_idx in range(num_chunks):
+            s0 = chunk_idx * chunk_size
+            s1 = min(int(S), (chunk_idx + 1) * chunk_size)
+
+            logits = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
+            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
+            softmax_output = log_probs.exp()
+
+            gi = global_indices[:, s0:s1, :]
+            in_range = (gi >= int(vocab_start_index)) & (gi < int(vocab_end_index))
+            li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1)
+
+            # Sum over K for the softmax term
+            go_chunk = grad_output[:, s0:s1, :]  # [B, Sc, K]
+            go_sum = go_chunk.sum(dim=-1, keepdim=True)  # [B, Sc, 1]
+
+            grad_input = softmax_output.neg()
+            grad_input = grad_input.mul_(go_sum)
+
+            # Positive scatter term: add gradients to selected indices
+            # Mask grad_output for indices not on this shard
+            go_masked = go_chunk * in_range.to(dtype=go_chunk.dtype)
+            # Flatten for scatter_add
+            flat_grad = grad_input.view(-1)
+            # compute flattened indices positions
+            Bc, Sc = go_masked.shape[0], go_masked.shape[1]
+            # row offset per [B, Sc]
+            row = (
+                torch.arange(Bc, device=grad_input.device)
+                .view(-1, 1)
+                .expand(-1, Sc)
+                .reshape(-1)
+            )
+            col = torch.arange(Sc, device=grad_input.device).expand(Bc, -1).reshape(-1)
+            flat_idx_base = (row * Sc + col) * V_local  # [Bc*Sc]
+            # selected flat indices
+            flat_li = li.reshape(-1, li.shape[-1])  # [Bc*Sc, K]
+            flat_base_expanded = flat_idx_base.unsqueeze(-1).expand_as(flat_li)
+            flat_chosen = (flat_base_expanded + flat_li).reshape(-1)
+            flat_go = go_masked.reshape(-1)
+            flat_grad.scatter_add_(0, flat_chosen, flat_go)
+
+            all_grad_input.append(grad_input)
+
+        grad_input_total = (
+            torch.cat(all_grad_input, dim=1)
+            if len(all_grad_input) > 1
+            else all_grad_input[0]
+        )
+
+        return grad_input_total, None, None, None, None, None, None
+
+
 def dtensor_from_parallel_logits_to_logprobs(
     vocab_parallel_logits: torch.Tensor,
     target: DTensor | torch.Tensor,
@@ -853,3 +979,77 @@ def gather_logits_at_global_indices(
             gathered_logits = gathered_logits[:, :-pad_len, :]
 
     return gathered_logits
+
+
+class ChunkedDistributedEntropy(torch.autograd.Function):
+    """Compute H_all = sum_v p_v log p_v across TP with chunking over sequence.
+
+    Forward returns [B, S] tensor of global entropy; backward propagates through logits.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        vocab_parallel_logits: torch.Tensor,  # [B, S, V_local]
+        chunk_size: int,
+        tp_group: torch.distributed.ProcessGroup,
+        inference_only: bool = False,
+    ) -> torch.Tensor:
+        B, S, _ = vocab_parallel_logits.shape
+        num_chunks = (int(S) + chunk_size - 1) // chunk_size
+        out_chunks: list[torch.Tensor] = []
+
+        for chunk_idx in range(num_chunks):
+            s0 = chunk_idx * chunk_size
+            s1 = min(int(S), (chunk_idx + 1) * chunk_size)
+
+            logits = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
+            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
+            softmax_output = log_probs.exp()
+            H_local = (softmax_output * log_probs).sum(dim=-1)  # [B, Sc]
+            torch.distributed.all_reduce(
+                H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+            out_chunks.append(H_local)
+
+        H_all = torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
+
+        if not inference_only:
+            ctx.save_for_backward(vocab_parallel_logits)
+            ctx.chunk_size = int(chunk_size)
+            ctx.tp_group = tp_group
+
+        return H_all.contiguous()
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
+        grad_output = grad_outputs[0]  # [B, S]
+        (vocab_parallel_logits,) = ctx.saved_tensors
+        chunk_size: int = ctx.chunk_size
+        tp_group = ctx.tp_group
+
+        B, S, V_local = vocab_parallel_logits.shape
+        num_chunks = (int(S) + chunk_size - 1) // chunk_size
+        grads: list[torch.Tensor] = []
+
+        for chunk_idx in range(num_chunks):
+            s0 = chunk_idx * chunk_size
+            s1 = min(int(S), (chunk_idx + 1) * chunk_size)
+
+            logits = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
+            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
+            softmax_output = log_probs.exp()
+            H_local = (softmax_output * log_probs).sum(dim=-1)
+            torch.distributed.all_reduce(
+                H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+
+            # dH/dz = softmax * (log_probs - H_all)
+            grad_chunk = softmax_output * (log_probs - H_local.unsqueeze(-1))
+            grad_chunk.mul_(grad_output[:, s0:s1].unsqueeze(-1))
+            grads.append(grad_chunk)
+
+        grad_input = torch.cat(grads, dim=1) if len(grads) > 1 else grads[0]
+        return grad_input, None, None, None
