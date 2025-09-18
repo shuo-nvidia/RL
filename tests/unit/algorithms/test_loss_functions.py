@@ -1803,7 +1803,7 @@ def test_distillation_loss_fn_initialization():
     assert loss_fn.alpha == 0.5
     assert loss_fn.kl_type == "forward"
     assert loss_fn.mixed_kl_weight == 0.5
-    assert loss_fn.zero_outside_topk == False
+    assert not loss_fn.zero_outside_topk
 
     # Test with custom values
     custom_config = {
@@ -1818,7 +1818,7 @@ def test_distillation_loss_fn_initialization():
     assert loss_fn.alpha == 0.7
     assert loss_fn.kl_type == "reverse"
     assert loss_fn.mixed_kl_weight == 0.3
-    assert loss_fn.zero_outside_topk == True
+    assert loss_fn.zero_outside_topk
 
 
 def test_distillation_loss_fn_call():
