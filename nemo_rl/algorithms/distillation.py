@@ -575,7 +575,6 @@ def distillation_train(
                             "input_lengths": input_lengths,
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
-                            # "generation_logprobs": flat_messages["generation_logprobs"], [TODO] we may use this to sample top k from student model's logits
                         }
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure

@@ -1189,10 +1189,12 @@ class DTensorPolicyWorker:
         k: int,
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[Any]:
-        """Return per-position top-k logits and global indices.
+        """Return per-position top-k logits and corresponding global indices.
 
         Notes:
-        - Operates on logits[:, :-1, :] so that positions align with next-token targets.
+        - Return shapes are [B, S, k].
+        - Computes top-k over the full sequence (no trimming of the last position).
+        - If alignment with next-token targets is required, the caller should handle it.
         - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
@@ -1202,12 +1204,10 @@ class DTensorPolicyWorker:
             if micro_batch_size is not None
             else self.cfg["logprob_batch_size"]
         )
-        # logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
 
-        self.model.eval()
         out_topk_vals = []
         out_topk_idx = []
         self.model.eval()
@@ -1332,16 +1332,6 @@ class DTensorPolicyWorker:
                     # IMPORTANT: do not apply generation temperature scaling here for teacher top-k
 
                     if self.cp_size > 1:
-                        seq_index_tensor = (
-                            DTensor.from_local(
-                                seq_index,
-                                device_mesh=self.cp_mesh,
-                                placements=[Shard(1)],
-                            )
-                            .full_tensor()
-                            .squeeze(0)
-                        )
-
                         if isinstance(logits, DTensor):
                             # Must be tp sharded
                             assert (
@@ -1400,7 +1390,7 @@ class DTensorPolicyWorker:
                             vocab_end_index = (tp_rank + 1) * V_local
 
                             vals, idx = distributed_vocab_topk(
-                                local_logits[:, :, :],
+                                local_logits,
                                 k=k,
                                 tp_group=tp_group,
                                 vocab_start_index=vocab_start_index,
@@ -1408,7 +1398,7 @@ class DTensorPolicyWorker:
                             )
                         else:
                             full_logits = logits.to(torch.float32)
-                            vals, idx = torch.topk(full_logits[:, :, :], k=k, dim=-1)
+                            vals, idx = torch.topk(full_logits, k=k, dim=-1)
 
                 # Handle sequence packing unpacking
                 if self.enable_seq_packing:
@@ -1449,8 +1439,8 @@ class DTensorPolicyWorker:
                     batch_size = original_batch_size
                     seq_len = original_seq_len
 
-                # Keep only real sequence tokens (mask padded positions)
-                # We keep shapes [B, S-1, k]; caller can handle masking downstream if needed.
+                # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
+                # Shapes remain [B, S, k].
                 out_topk_vals.append(vals.cpu())
                 out_topk_idx.append(idx.cpu())
 

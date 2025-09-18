@@ -131,24 +131,27 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
                 pad_value = pad_value_dict.get(k, 0)
-                # bug出在这里，当train_data中包含3维tensor时，下面的flatten()会错误展平后两个维度。
-                # grpo在调用这个函数时只会传入二维tensor，但是sft和dpo这里还需要检查有无三维特殊情况。
-                # 现在添加了如下if语句处理蒸馏中的三维情况（即teacher topk logits和indices），else后为原代码。
+                # We now add the following if statement to handle the 3D case in distillation
+                # (i.e., teacher top-k logits and indices); the else branch is the original code.
                 if list_of_tensors[0].ndim == 3:
-                    # 对三维张量，只在序列维度（这里是第1维）补 pad，保留特征维度
+                    # For 3D tensors, pad only along the sequence dimension (the 1st dimension here),
+                    # keeping the feature dimension.
                     max_seq_len = max(tensor.shape[1] for tensor in list_of_tensors)
                     padded_tensors = []
                     for tensor in list_of_tensors:
-                        # 在第1维补 pad 到 max_seq_len
+                        # Pad along the 1st dimension to max_seq_len.
                         pad_length = max_seq_len - tensor.shape[1]
                         padded = torch.nn.functional.pad(
                             tensor,
-                            (0, 0, 0, pad_length),  # 只补最后二个维度（序列长度）
+                            # Only pad the last two dimensions (sequence length).
+                            (0, 0, 0, pad_length),
                             mode="constant",
                             value=pad_value,
                         )
                         padded_tensors.append(padded)
-                    tensor_or_list = torch.cat(padded_tensors, dim=0)  # 在批次维度拼接
+                    tensor_or_list = torch.cat(
+                        padded_tensors, dim=0
+                    )  # concatenate along the batch dimension
                 else:
                     list_of_tensors = [
                         row.flatten() for tensor in list_of_tensors for row in tensor

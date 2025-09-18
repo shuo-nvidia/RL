@@ -842,7 +842,6 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
-    tau: NotRequired[float]
 
 
 class DistillationLossFn(LossFunction):
