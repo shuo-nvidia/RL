@@ -1619,7 +1619,7 @@ def test_distillation_loss_topk_filtering():
 
 
 def test_distillation_loss_invalid_k_zero():
-    """Test that k=0 should cause an error or invalid behavior."""
+    """Test that k=0 should raise a ValueError."""
     # Test with k=0 which should be invalid
     data, student_logits = setup_distillation_test_data(topk=0)
 
@@ -1632,28 +1632,15 @@ def test_distillation_loss_invalid_k_zero():
         }
     )
 
-    # This should either raise an error or produce invalid results
-    try:
-        loss, metrics = loss_fn(
+    # This should raise a ValueError for k=0
+    with pytest.raises(ValueError, match="topk must be positive"):
+        loss_fn(
             student_logits,
             data,
             global_valid_seqs=torch.sum(data["sample_mask"]),
             global_valid_toks=torch.sum(
                 data["sample_mask"].unsqueeze(-1) * data["token_mask"]
             ),
-        )
-
-        # If no error is raised, the result should be invalid (NaN or Inf)
-        assert torch.isnan(loss) or torch.isinf(loss), (
-            f"Expected NaN or Inf for k=0, got {loss}"
-        )
-
-    except (ValueError, RuntimeError) as e:
-        # Expected behavior: k=0 should raise an error
-        assert (
-            "k" in str(e).lower()
-            or "empty" in str(e).lower()
-            or "zero" in str(e).lower()
         )
 
 

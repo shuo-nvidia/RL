@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
+import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -372,6 +373,18 @@ def setup(
     if student_generation is not None:
         state_dict_info = student_policy.prepare_refit_info()
         student_generation.prepare_refit_info(state_dict_info)
+
+    # if it is not colocated inference, initialize collective communication for update weights
+    if not colocated_inference:
+        ip, port = train_cluster.get_master_address_and_port()
+        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
+        # inference cluster + head node of the train cluster
+        world_size = inference_nodes * inference_gpus_per_node + 1
+        # init collective
+        futures_train = student_policy.init_collective(ip, port, world_size)
+        futures_inference = student_generation.init_collective(ip, port, world_size)  # type: ignore
+        # wait for all futures to complete
+        ray.get(futures_train + futures_inference)
 
     loss_fn = DistillationLossFn(loss_config)
 
