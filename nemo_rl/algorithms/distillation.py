@@ -793,6 +793,12 @@ def validate(
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return {}, {}
 
+    if val_task_to_env is None:
+        print(
+            "  ⚠️ No validation task to environment mapping provided, skipping validation"
+        )
+        return {}, {}
+
     timer = Timer()
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
