@@ -23,7 +23,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_distillation_math.py \
-    policy.model_name=Qwen/Qwen3-0.6B \
+    policy.model_name=Qwen/Qwen3-0.6B-Base \
     teacher.model_name=Qwen/Qwen3-0.6B \
     cluster.gpus_per_node=2 \
     policy.dtensor_cfg.tensor_parallel_size=1 \
@@ -46,4 +46,4 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-  'data["train/loss"]["3"] < 10.0'
+  'data["train/loss"]["3"] < 1.0'
