@@ -41,7 +41,7 @@ policy: &POLICY_BASE
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 4
+    tensor_parallel_size: 2
     context_parallel_size: 1
     custom_parallel_plan: null
 
