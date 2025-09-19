@@ -1029,14 +1029,14 @@ class DistillationLossFn(LossFunction):
         elif self.kl_type == "reverse":
             per_token_kl = (
                 student_probs * (student_topk_logprobs - teacher_topk_logprobs)
-                + loss_correction_term
+                + loss_correction_term.unsqueeze(-1)
             )
         else:
             # mixed KL
             kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
             kl_reverse = (
                 student_probs * (student_topk_logprobs - teacher_topk_logprobs)
-                + loss_correction_term
+                + loss_correction_term.unsqueeze(-1)
             )
             per_token_kl = (
                 self.mixed_kl_weight * kl_forward
