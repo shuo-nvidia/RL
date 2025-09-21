@@ -166,4 +166,3 @@ class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         pass
-

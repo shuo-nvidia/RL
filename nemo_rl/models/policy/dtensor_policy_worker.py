@@ -48,17 +48,17 @@ from transformers.models.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import get_logprobs_from_vocab_parallel_logits
+from nemo_rl.distributed.model_utils import (
+    allgather_cp_sharded_tensor,
+    distributed_vocab_topk,
+    get_logprobs_from_vocab_parallel_logits,
+)
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
     get_grad_norm,
     to_local_if_dtensor,
 )
-from nemo_rl.distributed.model_utils import (
-    distributed_vocab_topk, 
-    allgather_cp_sharded_tensor)
-
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
@@ -83,6 +83,7 @@ from nemo_rl.utils.native_checkpoint import (
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
 
 @contextmanager
 def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
@@ -806,7 +807,9 @@ class DTensorPolicyWorker:
                             mb,
                             global_valid_seqs,
                             global_valid_toks,
-                            context_parallel_group=self.cp_mesh.get_group() if self.cp_size > 1 else None,
+                            context_parallel_group=self.cp_mesh.get_group()
+                            if self.cp_size > 1
+                            else None,
                         )
                         del logits
 
@@ -1335,11 +1338,12 @@ class DTensorPolicyWorker:
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
-
         topk_batch_size = (
-            micro_batch_size if micro_batch_size is not None else self.cfg["logprob_batch_size"]
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
         )
-        #logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
+        # logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
 
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
@@ -1375,21 +1379,21 @@ class DTensorPolicyWorker:
             else:
                 mb_iterator = data.make_microbatch_iterator(topk_batch_size)
                 iterator_len = data.size // topk_batch_size
-                
+
             for batch_idx, lp_batch in enumerate(
                 itertools.chain(mb_iterator, dummy_iterator)
-                ):
+            ):
                 input_ids = lp_batch.get("input_ids").cuda()
                 input_lengths = lp_batch.get("input_lengths")
                 vlm_kwargs = lp_batch.get_multimodal_dict(
                     as_tensors=True, device=input_ids.device
                 )
                 batch_size, seq_len = input_ids.shape
-                
+
                 # Store original shapes for unpacking later
                 original_batch_size = batch_size
                 original_seq_len = seq_len
-                
+
                 if self.enable_seq_packing:
                     assert len(vlm_kwargs) == 0, (
                         "multimodal kwargs are not supported for sequence packing"
@@ -1414,9 +1418,11 @@ class DTensorPolicyWorker:
                         (batch_size, seq_len), dtype=torch.long, device=input_ids.device
                     )
                     for i, length in enumerate(input_lengths):
-                        attention_mask[i, : length] = 1
+                        attention_mask[i, :length] = 1
 
-                    position_ids = torch.arange(seq_len, device=input_ids.device).repeat(batch_size, 1)
+                    position_ids = torch.arange(
+                        seq_len, device=input_ids.device
+                    ).repeat(batch_size, 1)
                     flash_attn_kwargs = {}
 
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
@@ -1458,7 +1464,7 @@ class DTensorPolicyWorker:
                         )
                         if len(vlm_kwargs) > 0:
                             del model_args["flash_attn_kwargs"]
-                        
+
                         outputs = self.model(**model_args)
 
                     logits = outputs.logits  # [B, S, V] or DTensor sharded on V
@@ -1494,16 +1500,16 @@ class DTensorPolicyWorker:
                                 device_mesh=self.device_mesh[("cp", "tp")],
                                 placements=[Shard(sequence_dim), Shard(-1)],
                             )
- 
+
                         # deal with TP first
                         local_logits = logits.to_local()  # [B, S_cp, V_tp]
-                        
+
                         tp_group = self.tp_mesh.get_group()
                         tp_rank = torch.distributed.get_rank(tp_group)
                         V_local = int(local_logits.shape[-1])
                         vocab_start_index = tp_rank * V_local
                         vocab_end_index = (tp_rank + 1) * V_local
-                        
+
                         vals, idx = distributed_vocab_topk(
                             local_logits,
                             k=k,
@@ -1514,7 +1520,7 @@ class DTensorPolicyWorker:
                         # [B, S_cp, k]
 
                         cp_group = self.cp_mesh.get_group()
-                        
+
                         vals = allgather_cp_sharded_tensor(
                             vals, cp_group, seq_dim=sequence_dim
                         )
@@ -1548,7 +1554,7 @@ class DTensorPolicyWorker:
                     # Unpack top-k results from packed format back to original batch format
                     # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
                     # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
-                    
+
                     # Create tensors to store unpacked results
                     unpacked_vals = torch.zeros(
                         (original_batch_size, original_seq_len, k),
@@ -1560,24 +1566,24 @@ class DTensorPolicyWorker:
                         dtype=idx.dtype,
                         device=idx.device,
                     )
-                    
+
                     # Get cumulative sequence lengths for unpacking
                     cu_seqlens = flash_attn_kwargs.cu_seqlens_q
-                    
+
                     for i in range(original_batch_size):
                         start = cu_seqlens[i].item()
                         end = cu_seqlens[i + 1].item()
                         seq_len_actual = input_lengths[i].item()
-                        
+
                         # Extract the corresponding portion from packed results
                         # Note: vals and idx are [1, packed_seq_len, k] due to packing
                         unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
                         unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
-                    
+
                     # Replace with unpacked results
                     vals = unpacked_vals
                     idx = unpacked_idx
-                    
+
                     # Update batch_size and seq_len for consistency
                     batch_size = original_batch_size
                     seq_len = original_seq_len
@@ -1587,7 +1593,7 @@ class DTensorPolicyWorker:
                     # Unpack top-k results from packed format back to original batch format
                     # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
                     # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
-                    
+
                     # Create tensors to store unpacked results
                     unpacked_vals = torch.zeros(
                         (original_batch_size, original_seq_len, k),
@@ -1599,24 +1605,24 @@ class DTensorPolicyWorker:
                         dtype=idx.dtype,
                         device=idx.device,
                     )
-                    
+
                     # Get cumulative sequence lengths for unpacking
                     cu_seqlens = flash_attn_kwargs.cu_seqlens_q
-                    
+
                     for i in range(original_batch_size):
                         start = cu_seqlens[i].item()
                         end = cu_seqlens[i + 1].item()
                         seq_len_actual = input_lengths[i].item()
-                        
+
                         # Extract the corresponding portion from packed results
                         # Note: vals and idx are [1, packed_seq_len, k] due to packing
                         unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
                         unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
-                    
+
                     # Replace with unpacked results
                     vals = unpacked_vals
                     idx = unpacked_idx
-                    
+
                     # Update batch_size and seq_len for consistency
                     batch_size = original_batch_size
                     seq_len = original_seq_len
@@ -1635,16 +1641,24 @@ class DTensorPolicyWorker:
             pad_needed = target_seq_len - vals.shape[1]
             if pad_needed > 0:
                 # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
-                vals = torch.nn.functional.pad(vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0)
-                idx = torch.nn.functional.pad(idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0)
+                vals = torch.nn.functional.pad(
+                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                )
+                idx = torch.nn.functional.pad(
+                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
+                )
             all_topk_vals_padded.append(vals)
             all_topk_idx_padded.append(idx)
 
         ret["topk_logits"] = (
-            torch.cat(all_topk_vals_padded, dim=0) if len(all_topk_vals_padded) > 1 else all_topk_vals_padded[0]
+            torch.cat(all_topk_vals_padded, dim=0)
+            if len(all_topk_vals_padded) > 1
+            else all_topk_vals_padded[0]
         ).cpu()
         ret["topk_indices"] = (
-            torch.cat(all_topk_idx_padded, dim=0) if len(all_topk_idx_padded) > 1 else all_topk_idx_padded[0]
+            torch.cat(all_topk_idx_padded, dim=0)
+            if len(all_topk_idx_padded) > 1
+            else all_topk_idx_padded[0]
         ).cpu()
         return ret
 
