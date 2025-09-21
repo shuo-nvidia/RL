@@ -25,6 +25,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     gather_logits_at_global_indices,
+    _get_tokens_on_this_cp_rank,
+    allgather_cp_sharded_tensor
+    
 )
 from nemo_rl.models.dtensor.parallelize import (
     get_logprobs_from_vocab_parallel_logits,
@@ -852,7 +855,7 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg.get("kl_type", "forward")  
         self.mixed_kl_weight = cfg.get("mixed_kl_weight", 0.5)
         self.zero_outside_topk=cfg.get("zero_outside_topk", False)
-        self.log_infinitesimal=-23                   # log of 1e-10
+        self.log_infinitesimal=-100               
         self.loss_type = LossType.TOKEN_LEVEL
     def __call__(
         self,
@@ -870,10 +873,13 @@ class DistillationLossFn(LossFunction):
         - Aligns token positions with next-token prediction: uses logits[:, :-1] vs input_ids[:, 1:].
         - Handles DTensor/TP the same way as NLLLoss to avoid mixing DTensor with torch.Tensor in gather.
         """
-
         # Basic shapes
         input_ids = data["input_ids"]
         batch_size = input_ids.shape[0]
+
+        # CP support: get CP group and size
+        cp_group = context_parallel_group
+        cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
         # Ensure float32 for stability (match other losses)
         next_token_logits = next_token_logits.to(torch.float32)
@@ -884,10 +890,13 @@ class DistillationLossFn(LossFunction):
         teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
         teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
 
-        teacher_topk_logits = teacher_topk_logits[:, :-1, :]
-        teacher_topk_indices = teacher_topk_indices[:, :-1, :]
-
-        student_logits_trimmed = next_token_logits[:, :-1, :]
+        if cp_size>1:   # if use cp, we will trim the student sequence length after CP aggregation
+            student_logits_trimmed = next_token_logits
+        else:         
+            student_logits_trimmed = next_token_logits[:, :-1, :]
+            teacher_topk_logits = teacher_topk_logits[:, :-1, :]
+            teacher_topk_indices = teacher_topk_indices[:, :-1, :]
+            
         if vocab_parallel_group is not None:
             assert vocab_parallel_rank is not None, (
                 "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
@@ -899,6 +908,7 @@ class DistillationLossFn(LossFunction):
                 student_logits_trimmed,
                 teacher_topk_indices,
                 tp_group=vocab_parallel_group,
+                cp_group=cp_group,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
             )
@@ -907,9 +917,12 @@ class DistillationLossFn(LossFunction):
             device_mesh = next_token_logits.device_mesh
             tp_group = device_mesh.get_group("tp")
             tp_rank = tp_group.rank()
-
+            
             local_student_logits = next_token_logits.to_local()  # [B, S, V_local]
-            local_student_logits = local_student_logits[:, :-1, :]
+            if cp_size>1:
+                pass
+            else:
+                local_student_logits = local_student_logits[:, :-1, :]
             V_local = int(local_student_logits.shape[-1])
             vocab_start_index = tp_rank * V_local
             vocab_end_index = (tp_rank + 1) * V_local
@@ -919,6 +932,7 @@ class DistillationLossFn(LossFunction):
                 local_student_logits,
                 teacher_topk_indices,
                 tp_group=tp_group,
+                cp_group=cp_group,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
             )
@@ -937,22 +951,32 @@ class DistillationLossFn(LossFunction):
                 )
 
         tau = float(data.get("tau", self.temperature))
+        
         # Move teacher tensors to the same device/dtype as student_topk_logits
         if self.zero_outside_topk:
             teacher_topk_logits = teacher_topk_logits.to(student_topk_logprobs.device, dtype=student_topk_logprobs.dtype)
         else:
             teacher_topk_logits = teacher_topk_logits.to(student_topk_logits.device, dtype=student_topk_logits.dtype)
         
+        if cp_size>1:
+            teacher_topk_logits = teacher_topk_logits[:, :-1, :]
+            student_topk_logits = student_topk_logits[:, :-1, :]
+
         teacher_log_probs = torch.nn.functional.log_softmax(
             teacher_topk_logits / float(tau), dim=-1
-        )  # [B, S-1, k]
-        teacher_probs = teacher_log_probs.exp() # [B, S-1, k]
+        )  
+
         if self.zero_outside_topk:
             student_log_probs = student_topk_logprobs
         else:
             student_log_probs = torch.nn.functional.log_softmax(student_topk_logits, dim=-1) # [B, S-1, k]
+           
+        # CP handling is now done inside gather_logits_at_global_indices
+        # No need for manual CP gather here
         
         student_probs = student_log_probs.exp() # [B, S-1, k]
+        teacher_probs = teacher_log_probs.exp() # [B, S-1, k]
+
         if self.zero_outside_topk and kl_type != "forward":
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
             del H_all

@@ -5,7 +5,7 @@ distillation:
     max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     max_num_steps: 1000
     val_batch_size: 64
-    val_period: 10
+    val_period: 20
     val_at_start: false
     max_val_samples: 512
     topk_logits_k: 64
@@ -14,7 +14,7 @@ distillation:
 loss_fn:
     temperature: 1.0
     alpha: 1.0
-    kl_type: "forward" # forward, reverse, mixed
+    kl_type: "mixed" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
     zero_outside_topk: false # if true, tp should be 1: zero out the teacher logits outside the top k when calculate forward KL loss
 
@@ -35,7 +35,7 @@ policy: &POLICY_BASE
     train_micro_batch_size: 1
     generation_batch_size: 64
     logprob_batch_size: 1
-    max_total_sequence_length: 16384
+    max_total_sequence_length: 8192
     precision: "bfloat16"
     logprob_chunk_size: null
 
@@ -45,11 +45,11 @@ policy: &POLICY_BASE
         sequence_parallel: false
         activation_checkpointing: true
         tensor_parallel_size: 2
-        context_parallel_size: 1
+        context_parallel_size: 2
         custom_parallel_plan: null
 
     dynamic_batching:
-        enabled: False
+        enabled: true
         train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
         logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
         sequence_length_round: 64
@@ -64,8 +64,8 @@ policy: &POLICY_BASE
     max_grad_norm: 1.0
     # makes the training sequence length divisible by the tensor parallel size
     # this is useful for sequence parallel training
-    make_sequence_length_divisible_by: ${.dtensor_cfg.tensor_parallel_size}
-
+    # must be divisible by 2*cp
+    make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
     optimizer:
         name: "torch.optim.AdamW"
         kwargs:
@@ -129,6 +129,7 @@ teacher:
     model_name: "Qwen/Qwen3-4B"
     dtensor_cfg:
         <<: *DTENSOR_BASE
+        context_parallel_size: 2 
         tensor_parallel_size: 4
     # generation_batch_size: 64
     # max_total_sequence_length: 8192

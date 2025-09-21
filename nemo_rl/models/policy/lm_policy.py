@@ -380,10 +380,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
+                "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
             output_is_replicated=[
+                "context_parallel",
                 "tensor_parallel",
                 "pipeline_parallel",
             ],
@@ -765,4 +767,3 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Stop GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
-
