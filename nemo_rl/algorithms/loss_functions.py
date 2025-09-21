@@ -1014,13 +1014,13 @@ class DistillationLossFn(LossFunction):
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
-        loss_correction_term = 0.0
+        loss_correction_term = torch.zeros_like(student_probs)
         if self.zero_outside_topk and self.kl_type != "forward":
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
-            del H_all
             P_rest = 1 - (student_probs.sum(-1))
             # The entropy and prob of the rest of the tokens [B, S-1]
             loss_correction_term = H_rest - self.log_infinitesimal * P_rest
+            loss_correction_term = loss_correction_term.unsqueeze(-1)  # [B, S-1, 1]
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
