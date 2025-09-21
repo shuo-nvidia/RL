@@ -154,6 +154,21 @@ def setup(
         "A generation config in the PolicyConfig is required for distillation"
     )
 
+    # Disallow Megatron paths (generation/training) and DTensor sequence parallel
+    assert generation_config["backend"] != "megatron", (
+        "Distillation does not support Megatron generation backend; please use vLLM."
+    )
+    for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
+        megatron_cfg = cfg.get("megatron_cfg")  # type: ignore[assignment]
+        if megatron_cfg and megatron_cfg.get("enabled", False):
+            raise AssertionError(
+                f"Distillation does not support Megatron training path ({who} policy)."
+            )
+        dtensor_cfg = cfg.get("dtensor_cfg", {})  # type: ignore[assignment]
+        assert not dtensor_cfg.get("sequence_parallel", False), (
+            f"Distillation does not support DTensor sequence_parallel ({who} policy)."
+        )
+
     # Set random seed
     set_seed(distillation_config["seed"])
 
