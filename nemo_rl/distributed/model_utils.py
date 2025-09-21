@@ -899,7 +899,7 @@ def distributed_vocab_topk(
 def gather_logits_at_global_indices(
     vocab_parallel_logits: torch.Tensor,
     global_indices: torch.Tensor,
-    tp_group: torch.distributed.ProcessGroup,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
     vocab_start_index: int,
@@ -913,11 +913,11 @@ def gather_logits_at_global_indices(
     Args:
         vocab_parallel_logits: [B, S_cp, V_local] where S_cp is CP sharded sequence length
         global_indices: [B, S_full, k] where S_full is full sequence length
-        tp_group: tensor-parallel process group
+        tp_group: Optional tensor-parallel process group. If None, treats logits as full-vocab (no TP) and skips TP all-reduce.
         vocab_start_index: global vocab start for this rank (inclusive)
         vocab_end_index: global vocab end for this rank (exclusive)
         chunk_size: optional chunk along sequence dim to bound memory
-        cp_group: context-parallel process group
+        cp_group: Optional context-parallel process group
 
     Returns:
         gathered_logits: [B, S_full, k]
@@ -959,9 +959,10 @@ def gather_logits_at_global_indices(
         local_vals = torch.gather(logits[:, s0:s1, :], dim=-1, index=li)
         local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
 
-        torch.distributed.all_reduce(
-            local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
-        )
+        if tp_group is not None:
+            torch.distributed.all_reduce(
+                local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
         out_chunks.append(local_vals)
 
     gathered_logits = (
