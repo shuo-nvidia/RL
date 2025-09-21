@@ -2,9 +2,9 @@ distillation:
   num_prompts_per_step: 64
   num_generations_per_prompt: 1
   max_rollout_turns: 1
-  max_num_steps: 200
+  max_num_steps: 20
   val_batch_size: 32
-  val_period: 20
+  val_period: 10
   val_at_start: false
   max_val_samples: 256
   topk_logits_k: 64
@@ -13,7 +13,7 @@ distillation:
 loss_fn:
   temperature: 1.0
   alpha: 1.0
-  kl_type: "mixed"
+  kl_type: "reverse"
   mixed_kl_weight: 0.5
   zero_outside_topk: false
 
@@ -42,12 +42,12 @@ policy: &POLICY_BASE
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 1
+    tensor_parallel_size: 2
     context_parallel_size: 1
     custom_parallel_plan: null
 
   dynamic_batching:
-    enabled: true
+    enabled: false
     train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
     sequence_length_round: 64
@@ -117,7 +117,7 @@ teacher:
   dtensor_cfg:
     <<: *DTENSOR_BASE
     tensor_parallel_size: 4
-    context_parallel_size: 2
+    context_parallel_size: 1
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
@@ -132,15 +132,17 @@ env:
 
 logger:
   log_dir: "logs/distillation-qwen3-32b-to-1.7b-base"
-  num_val_samples_to_print: 5
   wandb_enabled: true
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: true
   wandb:
-    project: "nemo-distillation"
-    name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}"
-    entity: null
+    project: "nemo-rl"
+    name: "distillation-qwen3-32b-to-1.7b-base"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
 
 cluster:
   gpus_per_node: 8
