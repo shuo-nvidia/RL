@@ -1348,6 +1348,7 @@ class DTensorPolicyWorker:
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
 
+        self.model.eval()
         out_topk_vals = []
         out_topk_idx = []
         self.model.eval()
@@ -1423,6 +1424,7 @@ class DTensorPolicyWorker:
                     position_ids = torch.arange(
                         seq_len, device=input_ids.device
                     ).repeat(batch_size, 1)
+
                     flash_attn_kwargs = {}
 
                 with torch.autocast(device_type="cuda", dtype=self.dtype):
