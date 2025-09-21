@@ -137,7 +137,7 @@ def setup(
     """Main entry point for distillation algorithm.
 
     Returns:
-        tuple of student_policy, student_generation,
+        tuple of student_policy, teacher_policy, student_generation,
         train_dataloader, val_dataloader,
         loss_fn, logger, checkpointer, distillation_save_state, master_config
     """
@@ -312,7 +312,7 @@ def setup(
     # ==========================
     #      Student Policy
     # ==========================
-    print("\n▶ Setting up models...")
+    print("\n▶ Setting up student policy...")
 
     # Checkpoint paths
     if last_checkpoint_path:
@@ -336,7 +336,7 @@ def setup(
     # ==========================
     #      Teacher Policy
     # ==========================
-    print("\n▶ Setting up models...")
+    print("\n▶ Setting up teacher policy...")
     # Checkpoint paths
     weights_path = None
     optimizer_path = None
@@ -555,8 +555,8 @@ def distillation_train(
 
                 with timer.time("data_processing"):
                     # Add loss mask and advantages to each message in LLMMessageLogType
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
+                    for message_log in repeated_batch["message_log"]:
+                        for message in message_log:
                             if message["role"] == "assistant":
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
@@ -565,13 +565,7 @@ def distillation_train(
                                 message["token_loss_mask"] = torch.zeros_like(
                                     message["token_ids"]
                                 )
-                            # TODO: we may use this to sample top k from student model's logits
-                            """
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
-                            """
+
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -678,7 +672,8 @@ def distillation_train(
                         ):
                             warnings.warn(
                                 f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "Saving most recent k checkpoints instead."
+                                "Saving most recent k checkpoints instead.",
+                                stacklevel=2,
                             )
                             master_config["checkpointing"]["metric_name"] = None
 
