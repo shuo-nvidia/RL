@@ -891,7 +891,7 @@ class DistillationLossFn(LossFunction):
                 f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
                 "topk=0 is not supported as it would result in empty tensor operations."
             )
-            
+
         # Determine processing path and setup variables
         if vocab_parallel_group is not None:
             assert vocab_parallel_rank is not None, (
