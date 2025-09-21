@@ -145,10 +145,9 @@ def setup(
     )
     assert (                      # [TODO] we may support this for other kl_types in the future
         not loss_config.get("zero_outside_topk", False) 
-        or (policy_config["dtensor_cfg"]["tensor_parallel_size"] == 1 
-        and loss_config['kl_type']=="forward")
+        or (policy_config["dtensor_cfg"]["tensor_parallel_size"] == 1)
     ), (
-        f"zero_outside_topk=True requires tensor_parallel_size=1 and kl_type=forward, "
+        f"zero_outside_topk=True requires tensor_parallel_size=1, "
         f"but got tensor_parallel_size={policy_config['dtensor_cfg']['tensor_parallel_size']} and kl_type={loss_config['kl_type']}. "
     )
     # Set random seed
@@ -461,13 +460,15 @@ def distillation_train(
                     repeated_batch: BatchedDataDict[DatumSpec] = batch.repeat_interleave(
                         master_config["distillation"]["num_generations_per_prompt"]
                     )
+        
+                    ''' # not used in distillation
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
-                    #input_ids = batched_flat["token_ids"] # not used in distillation
-
+                    input_ids = batched_flat["token_ids"] 
+                    '''
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(f"▶ Generating responses for batch of size {repeated_batch.size}...")
                 with timer.time("prepare_for_generation"):
@@ -797,7 +798,7 @@ def validate(
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
-            to_env = [
+            to_env = [  
                 get_keys_from_message_log(
                     val_batch["message_log"][i], ["role", "content"]
                 )
