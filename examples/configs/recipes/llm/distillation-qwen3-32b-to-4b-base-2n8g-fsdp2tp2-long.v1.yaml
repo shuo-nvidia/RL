@@ -12,7 +12,6 @@ distillation:
 
 loss_fn:
   temperature: 1.0
-  alpha: 1.0
   kl_type: "mixed"
   mixed_kl_weight: 0.5
   zero_outside_topk: false

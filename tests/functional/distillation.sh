@@ -8,7 +8,7 @@ PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
 # Mark the current repo as safe, since wandb fetches metadata about the repo
 git config --global --add safe.directory $PROJECT_ROOT
 
-set -eou pipefail
+set -euo pipefail
 
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
