@@ -15,7 +15,7 @@ loss_fn:
     temperature: 1.0
     kl_type: "mixed" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
-    zero_outside_topk: false # if true, tp should be 1: zero out the teacher logits outside the top k when calculate forward KL loss
+    zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
 
 checkpointing:
     enabled: true
@@ -108,7 +108,7 @@ policy: &POLICY_BASE
             precision: ${...precision}
             tensor_parallel_size: 1
             pipeline_parallel_size: 1
-            enable_expert_parallel: false
+            expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
             gpu_memory_utilization: 0.6
             max_model_len: ${...max_total_sequence_length} # refer to local policy/teacher config
             enforce_eager: False
@@ -134,8 +134,6 @@ teacher:
         <<: *DTENSOR_BASE
         context_parallel_size: 2 
         tensor_parallel_size: 4
-    # generation_batch_size: 64
-    # max_total_sequence_length: 8192
 
 data:
     max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
