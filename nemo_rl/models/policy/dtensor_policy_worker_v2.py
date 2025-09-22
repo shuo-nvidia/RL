@@ -763,6 +763,9 @@ class DTensorPolicyWorkerV2:
                             mb,
                             global_valid_seqs,
                             global_valid_toks,
+                            context_parallel_group=self.cp_mesh.get_group()
+                            if self.cp_size > 1
+                            else None,
                         )
                         del logits
 

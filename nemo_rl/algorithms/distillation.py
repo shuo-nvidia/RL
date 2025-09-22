@@ -30,7 +30,8 @@ from nemo_rl.algorithms.loss_functions import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
+from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
@@ -155,7 +156,7 @@ def setup(
         "A generation config in the PolicyConfig is required for distillation"
     )
 
-    # Disallow Megatron paths (generation/training) and DTensor sequence parallel
+    # Disallow Megatron paths (generation/training)
     assert generation_config["backend"] != "megatron", (
         "Distillation does not support Megatron generation backend; please use vLLM."
     )
@@ -164,11 +165,29 @@ def setup(
         if megatron_cfg and megatron_cfg.get("enabled", False):
             raise AssertionError(
                 f"Distillation does not support Megatron training path ({who} policy)."
+                "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1151 for more details."
             )
-        dtensor_cfg = cfg.get("dtensor_cfg", {})  # type: ignore[assignment]
-        assert not dtensor_cfg.get("sequence_parallel", False), (
-            f"Distillation does not support DTensor sequence_parallel ({who} policy)."
+        # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
+        # This incompatibility is enforced in DTensor workers during initialization.
+        # Additionally, SP may not be compatible with SP for some models.
+        # Refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details.
+        # Therefore, we disable SP + packing for distillation.
+        dtensor_cfg = cfg.get("dtensor_cfg")  # type: ignore[assignment]
+        sequence_packing_cfg = cfg.get("sequence_packing")  # type: ignore[assignment]
+
+        dtensor_enabled = bool(dtensor_cfg and dtensor_cfg.get("enabled", False))
+        sequence_packing_enabled = bool(
+            sequence_packing_cfg and sequence_packing_cfg.get("enabled", False)
         )
+        sequence_parallel_enabled = bool(
+            dtensor_cfg and dtensor_cfg.get("sequence_parallel", False)
+        )
+
+        if dtensor_enabled and sequence_packing_enabled and sequence_parallel_enabled:
+            raise AssertionError(
+                f"Distillation does not support DTensor sequence parallel + sequence packing ({who} policy)."
+                "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
+            )
 
     # Set random seed
     set_seed(distillation_config["seed"])
@@ -692,6 +711,7 @@ def distillation_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config["checkpointing"],
                         )
                         torch.save(
                             dataloader.state_dict(),

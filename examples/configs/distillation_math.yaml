@@ -25,6 +25,8 @@ checkpointing:
     keep_top_k: 3
     save_period: 10
     checkpoint_must_save_by: null
+    model_save_format: "safetensors"
+    save_consolidated: false
 
 policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-1.7B-Base"
@@ -40,6 +42,7 @@ policy: &POLICY_BASE
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
+        _v2: true
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
