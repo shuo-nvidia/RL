@@ -164,12 +164,12 @@ def setup(
         megatron_cfg = cfg.get("megatron_cfg")  # type: ignore[assignment]
         if megatron_cfg and megatron_cfg.get("enabled", False):
             raise AssertionError(
-                f"Distillation does not support Megatron training path ({who} policy)."
+                f"Distillation does not support Megatron training path ({who} policy). "
                 "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1151 for more details."
             )
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
         # This incompatibility is enforced in DTensor workers during initialization.
-        # Additionally, SP may not be compatible with SP for some models.
+        # Additionally, SP may not be compatible with sequence packing for some models.
         # Refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details.
         # Therefore, we disable SP + packing for distillation.
         dtensor_cfg = cfg.get("dtensor_cfg")  # type: ignore[assignment]
@@ -185,7 +185,7 @@ def setup(
 
         if dtensor_enabled and sequence_packing_enabled and sequence_parallel_enabled:
             raise AssertionError(
-                f"Distillation does not support DTensor sequence parallel + sequence packing ({who} policy)."
+                f"Distillation does not support DTensor sequence parallel + sequence packing ({who} policy). "
                 "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
             )
 
@@ -513,14 +513,6 @@ def distillation_train(
                         )
                     )
 
-                    """ # not used in distillation
-                    # Convert LLMMessageLogType to FlatMessagesType for generation
-                    batched_flat, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    input_ids = batched_flat["token_ids"]
-                    """
                 # Generate responses - this updates the LLMMessageLogType in repeated_batch
                 print(
                     f"▶ Generating responses for batch of size {repeated_batch.size}..."
