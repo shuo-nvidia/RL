@@ -18,15 +18,15 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "checkpoints/distillation-qwen3-32b-to-4b-instruct-seqpack"
+  checkpoint_dir: "checkpoints/distillation-qwen3-32b-to-4b-base-noncolocated"
   metric_name: "val_reward"
   higher_is_better: true
   keep_top_k: 3
-  save_period: 10
+  save_period: 50
   checkpoint_must_save_by: null
 
 policy: &POLICY_BASE
-  model_name: "Qwen/Qwen3-4B-Instruct"
+  model_name: "Qwen/Qwen3-4B-Base"
   tokenizer:
     name: ${..model_name}
   train_global_batch_size: 32
@@ -41,7 +41,7 @@ policy: &POLICY_BASE
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: true
-    tensor_parallel_size: 2
+    tensor_parallel_size: 8
     context_parallel_size: 1
     custom_parallel_plan: null
 
@@ -52,7 +52,7 @@ policy: &POLICY_BASE
     sequence_length_round: 64
 
   sequence_packing:
-    enabled: true
+    enabled: false
     train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
@@ -63,7 +63,7 @@ policy: &POLICY_BASE
   optimizer:
     name: "torch.optim.AdamW"
     kwargs:
-      lr: 2.0e-5
+      lr: 1.0e-5
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1e-8
@@ -75,12 +75,12 @@ policy: &POLICY_BASE
       kwargs:
         start_factor: 0.1
         end_factor: 1.0
-        total_iters: 20
-    - name: "torch.optim.lr_scheduler.ConstantLR"
+        total_iters: 100
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
       kwargs:
-        factor: 1.0
-        total_iters: 10000000000
-    - milestones: [20]
+        T_max: 900
+        eta_min: 1e-7
+    - milestones: [100]
 
   generation:
     backend: "vllm"
@@ -106,10 +106,10 @@ policy: &POLICY_BASE
       distributed_executor_backend: null
 
     colocated:
-      enabled: true
+      enabled: false
       resources:
-        gpus_per_node: null
-        num_nodes: null
+        gpus_per_node: 8
+        num_nodes: 1
 
 teacher:
   <<: *POLICY_BASE
@@ -131,14 +131,14 @@ env:
     num_workers: 8
 
 logger:
-  log_dir: "logs/distillation-qwen3-32b-to-4b-instruct-seqpack"
+  log_dir: "logs/distillation-qwen3-32b-to-4b-base-noncolocated"
   wandb_enabled: true
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: true
   wandb:
     project: "nemo-rl"
-    name: "distillation-qwen3-32b-to-4b-instruct-seqpack"
+    name: "distillation-qwen3-32b-to-4b-base-noncolocated"
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10
