@@ -37,6 +37,7 @@ policy: &POLICY_BASE
   precision: "bfloat16"
   
   dtensor_cfg: &DTENSOR_BASE
+    _v2: true
     enabled: true
     cpu_offload: false
     sequence_parallel: false
