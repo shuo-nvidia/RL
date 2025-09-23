@@ -20,6 +20,7 @@ import numpy as np
 import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
@@ -116,6 +117,28 @@ class MasterConfig(TypedDict):
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
+def check_vocab_equality(
+    tokenizer: TokenizerType, student_model_name: str, teacher_model_name: str
+) -> None:
+    """Check if the vocab of the tokenizer (student) and the teacher tokenizer are equal."""
+    teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)
+
+    # 1) Exact token->id mapping equality
+    vocab_a = tokenizer.get_vocab()
+    vocab_b = teacher_tokenizer.get_vocab()
+    assert vocab_a == vocab_b, "Token->ID mapping differs between student and teacher"
+
+    # 2) Size consistency (sanity checks)
+    assert len(tokenizer) == len(teacher_tokenizer), (
+        "Effective vocab sizes differ between student and teacher"
+    )
+
+    # 3) Chech model.config.vocab_size to guarantee the last dimension of the logits is the same
+    student_config = AutoConfig.from_pretrained(student_model_name)
+    teacher_config = AutoConfig.from_pretrained(teacher_model_name)
+    assert student_config.vocab_size == teacher_config.vocab_size, (
+        "Model config vocab sizes differ between student and teacher"
+    )
 
 
 def setup(
@@ -354,6 +377,11 @@ def setup(
     # Checkpoint paths
     weights_path = None
     optimizer_path = None
+
+    if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
+        check_vocab_equality(
+            tokenizer, policy_config["model_name"], teacher_config["model_name"]
+        )
 
     teacher_policy = Policy(
         name_prefix="teacher",
