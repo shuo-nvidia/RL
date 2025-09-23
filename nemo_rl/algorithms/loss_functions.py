@@ -848,10 +848,10 @@ class DistillationLossFn(LossFunction):
     """Distillation loss function."""
 
     def __init__(self, cfg: DistillationLossConfig):
-        self.temperature = cfg.get("temperature", 1.0)
-        self.kl_type = cfg.get("kl_type", "forward")
-        self.mixed_kl_weight = cfg.get("mixed_kl_weight", 0.5)
-        self.zero_outside_topk = cfg.get("zero_outside_topk", False)
+        self.temperature = cfg["temperature"]
+        self.kl_type = cfg["kl_type"]
+        self.mixed_kl_weight = cfg["mixed_kl_weight"]
+        self.zero_outside_topk = cfg["zero_outside_topk"]
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 

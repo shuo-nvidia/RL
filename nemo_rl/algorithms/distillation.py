@@ -156,31 +156,29 @@ def setup(
         "A generation config in the PolicyConfig is required for distillation"
     )
 
-    # Disallow Megatron paths (generation/training)
+    # Disallow Megatron paths (generation/training) and SP + packing for distillation
     assert generation_config["backend"] != "megatron", (
         "Distillation does not support Megatron generation backend; please use vLLM."
     )
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
-        megatron_cfg = cfg.get("megatron_cfg")  # type: ignore[assignment]
-        if megatron_cfg and megatron_cfg.get("enabled", False):
+        if "megatron_cfg" in cfg and cfg["megatron_cfg"]["enabled"]:
             raise AssertionError(
                 f"Distillation does not support Megatron training path ({who} policy). "
                 "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1151 for more details."
             )
+
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
         # This incompatibility is enforced in DTensor workers during initialization.
         # Additionally, SP may not be compatible with sequence packing for some models.
         # Refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details.
         # Therefore, we disable SP + packing for distillation.
-        dtensor_cfg = cfg.get("dtensor_cfg")  # type: ignore[assignment]
-        sequence_packing_cfg = cfg.get("sequence_packing")  # type: ignore[assignment]
-
-        dtensor_enabled = bool(dtensor_cfg and dtensor_cfg.get("enabled", False))
-        sequence_packing_enabled = bool(
-            sequence_packing_cfg and sequence_packing_cfg.get("enabled", False)
+        dtensor_enabled = cfg["dtensor_cfg"]["enabled"]
+        sequence_packing_enabled = (
+            "sequence_packing" in cfg and cfg["sequence_packing"]["enabled"]
         )
-        sequence_parallel_enabled = bool(
-            dtensor_cfg and dtensor_cfg.get("sequence_parallel", False)
+        sequence_parallel_enabled = (
+            "sequence_parallel" in cfg["dtensor_cfg"]
+            and cfg["dtensor_cfg"]["sequence_parallel"]
         )
 
         if dtensor_enabled and sequence_packing_enabled and sequence_parallel_enabled:
@@ -265,10 +263,7 @@ def setup(
         inference_cluster = cluster
         print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
     else:
-        assert generation_config["backend"] != "megatron", (
-            "Non-colocated inference is not supported for Megatron generation backends. "
-            "Please use vLLM backend for generation."
-        )
+        # We has disallow megatron path for distillation above.
 
         # train resources will be updated through overall and inference resources below
         train_gpus_per_node = cluster_config["gpus_per_node"]
