@@ -829,7 +829,6 @@ class SequencePackingLossWrapper:
 
 
 class DistillationLossConfig(TypedDict):
-    temperature: float
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
@@ -848,7 +847,6 @@ class DistillationLossFn(LossFunction):
     """Distillation loss function."""
 
     def __init__(self, cfg: DistillationLossConfig):
-        self.temperature = cfg["temperature"]
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
@@ -913,6 +911,16 @@ class DistillationLossFn(LossFunction):
             parallel_group = tp_group
             logits_tensor = local_student_logits
             teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
+            # For DTensor, derive CP group/size from the device mesh to ensure CP-aware alignment
+            if (
+                device_mesh.mesh_dim_names is not None
+                and "cp" in device_mesh.mesh_dim_names
+            ):
+                cp_group = device_mesh.get_group("cp")
+                cp_size = cp_group.size()
+            else:
+                cp_group = None
+                cp_size = 1
         else:
             parallel_group = None
             logits_tensor = next_token_logits
@@ -1001,7 +1009,7 @@ class DistillationLossFn(LossFunction):
             student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
         )
         teacher_topk_logprobs = torch.nn.functional.log_softmax(
-            teacher_topk_logits / float(self.temperature), dim=-1
+            teacher_topk_logits, dim=-1
         )
 
         # Single point of next-token alignment after TP/CP processing
@@ -1014,36 +1022,35 @@ class DistillationLossFn(LossFunction):
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
-        loss_correction_term = torch.zeros_like(student_probs)
+        loss_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
         if self.zero_outside_topk and self.kl_type != "forward":
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
             P_rest = 1 - (student_probs.sum(-1))
             # The entropy and prob of the rest of the tokens [B, S-1]
-            loss_correction_term = H_rest - self.log_infinitesimal * P_rest
-            loss_correction_term = loss_correction_term.unsqueeze(-1)  # [B, S-1, 1]
+            loss_correction_term = H_rest - self.log_infinitesimal * P_rest  # [B, S-1]
+            if self.kl_type == "mixed":
+                loss_correction_term = loss_correction_term * (
+                    1.0 - self.mixed_kl_weight
+                )
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
                 teacher_topk_logprobs - student_topk_logprobs
             )
         elif self.kl_type == "reverse":
-            per_token_kl = (
-                student_probs * (student_topk_logprobs - teacher_topk_logprobs)
-                + loss_correction_term
+            per_token_kl = student_probs * (
+                student_topk_logprobs - teacher_topk_logprobs
             )
         else:
             # mixed KL
             kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
-            kl_reverse = (
-                student_probs * (student_topk_logprobs - teacher_topk_logprobs)
-                + loss_correction_term
-            )
+            kl_reverse = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
             per_token_kl = (
                 self.mixed_kl_weight * kl_forward
                 + (1.0 - self.mixed_kl_weight) * kl_reverse
             )
 
-        per_token_kl = per_token_kl.sum(dim=-1)  # [B, S-1]
+        per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:

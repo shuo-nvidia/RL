@@ -1453,7 +1453,6 @@ def test_distillation_loss_forward_kl():
 
     loss_fn = DistillationLossFn(
         {
-            "temperature": 1.0,
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
@@ -1485,7 +1484,6 @@ def test_distillation_loss_reverse_kl():
 
     loss_fn = DistillationLossFn(
         {
-            "temperature": 1.0,
             "kl_type": "reverse",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
@@ -1518,7 +1516,6 @@ def test_distillation_loss_mixed_kl():
     mixed_kl_weight = 0.3
     loss_fn = DistillationLossFn(
         {
-            "temperature": 1.0,
             "kl_type": "mixed",
             "mixed_kl_weight": mixed_kl_weight,
             "zero_outside_topk": False,
@@ -1544,39 +1541,6 @@ def test_distillation_loss_mixed_kl():
     assert "loss" in metrics
 
 
-def test_distillation_loss_temperature_scaling():
-    """Test temperature scaling effect on loss calculation."""
-    data, student_logits = setup_distillation_test_data()
-
-    temperatures = [0.5, 1.0, 2.0]
-    losses = []
-
-    for temp in temperatures:
-        loss_fn = DistillationLossFn(
-            {
-                "temperature": temp,
-                "kl_type": "forward",
-                "mixed_kl_weight": 0.5,
-                "zero_outside_topk": False,
-            }
-        )
-
-        loss, _ = loss_fn(
-            student_logits,
-            data,
-            global_valid_seqs=torch.sum(data["sample_mask"]),
-            global_valid_toks=torch.sum(
-                data["sample_mask"].unsqueeze(-1) * data["token_mask"]
-            ),
-        )
-        losses.append(loss.item())
-
-    # Verify that different temperatures produce different losses
-    assert not all(
-        abs(losses[i] - losses[i + 1]) < 1e-6 for i in range(len(losses) - 1)
-    )
-
-
 def test_distillation_loss_topk_filtering():
     """Test top-k filtering functionality with various k values."""
     # Test with different k values (excluding k=0 which should be invalid)
@@ -1587,7 +1551,6 @@ def test_distillation_loss_topk_filtering():
 
         loss_fn = DistillationLossFn(
             {
-                "temperature": 1.0,
                 "kl_type": "forward",
                 "mixed_kl_weight": 0.5,
                 "zero_outside_topk": False,
@@ -1625,7 +1588,6 @@ def test_distillation_loss_invalid_k_zero():
 
     loss_fn = DistillationLossFn(
         {
-            "temperature": 1.0,
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
@@ -1654,7 +1616,6 @@ def test_distillation_loss_zero_outside_topk():
 
         loss_fn = DistillationLossFn(
             {
-                "temperature": 1.0,
                 "kl_type": "forward",
                 "mixed_kl_weight": 0.5,
                 "zero_outside_topk": True,
@@ -1694,7 +1655,6 @@ def test_distillation_loss_gradient_flow():
 
     loss_fn = DistillationLossFn(
         {
-            "temperature": 1.0,
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
@@ -1726,7 +1686,6 @@ def test_distillation_loss_edge_cases():
 
     loss_fn = DistillationLossFn(
         {
-            "temperature": 1.0,
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
@@ -1777,20 +1736,17 @@ def test_distillation_loss_fn_initialization():
     """Test DistillationLossFn initialization."""
     # Test with default values
     loss_fn = DistillationLossFn({})
-    assert loss_fn.temperature == 1.0
     assert loss_fn.kl_type == "forward"
     assert loss_fn.mixed_kl_weight == 0.5
     assert not loss_fn.zero_outside_topk
 
     # Test with custom values
     custom_config = {
-        "temperature": 2.0,
         "kl_type": "reverse",
         "mixed_kl_weight": 0.3,
         "zero_outside_topk": True,
     }
     loss_fn = DistillationLossFn(custom_config)
-    assert loss_fn.temperature == 2.0
     assert loss_fn.kl_type == "reverse"
     assert loss_fn.mixed_kl_weight == 0.3
     assert loss_fn.zero_outside_topk
@@ -1802,7 +1758,6 @@ def test_distillation_loss_fn_call():
 
     loss_fn = DistillationLossFn(
         {
-            "temperature": 1.0,
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,

@@ -105,8 +105,6 @@ def mock_components():
 
     loss_fn = DistillationLossFn(
         {
-            "temperature": 1.0,
-            "alpha": 0.5,
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,
@@ -148,8 +146,6 @@ def mock_components():
             "model_name": "test-teacher",
         },
         "loss_fn": {
-            "temperature": 1.0,
-            "alpha": 0.5,
             "kl_type": "forward",
             "mixed_kl_weight": 0.5,
             "zero_outside_topk": False,

@@ -1469,8 +1469,14 @@ class DTensorPolicyWorker:
 
                         outputs = self.model(**model_args)
 
-                    logits = outputs.logits  # [B, S, V] or DTensor sharded on V
-                    # IMPORTANT: do not apply generation temperature scaling here for teacher top-k
+                    if not hasattr(outputs, "logits"):
+                        logits = self.model.lm_head(outputs.last_hidden_state)
+                    else:
+                        logits = outputs.logits
+                    del outputs
+
+                    # Apply temperature scaling
+                    logits = self._apply_temperature_scaling(logits)
 
                     if self.cp_size > 1:
                         if isinstance(logits, DTensor):
