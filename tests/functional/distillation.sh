@@ -32,7 +32,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     teacher.dtensor_cfg.context_parallel_size=1 \
     distillation.max_num_steps=3 \
     distillation.val_batch_size=1 \
-    distillation.val_period=3 \
+    distillation.val_period=10 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \

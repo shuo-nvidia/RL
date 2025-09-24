@@ -1735,7 +1735,12 @@ def test_distillation_loss_edge_cases():
 def test_distillation_loss_fn_initialization():
     """Test DistillationLossFn initialization."""
     # Test with default values
-    loss_fn = DistillationLossFn({})
+    default_config = {
+        "kl_type": "forward",
+        "mixed_kl_weight": 0.5,
+        "zero_outside_topk": False,
+    }
+    loss_fn = DistillationLossFn(default_config)
     assert loss_fn.kl_type == "forward"
     assert loss_fn.mixed_kl_weight == 0.5
     assert not loss_fn.zero_outside_topk
