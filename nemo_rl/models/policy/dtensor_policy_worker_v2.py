@@ -1304,7 +1304,7 @@ class DTensorPolicyWorkerV2:
         out_topk_idx = []
         self.model.eval()
 
-        with unshard_fsdp2_model(self.model), torch.no_grad():
+        with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
             if self.cfg["dynamic_batching"]["enabled"]:
