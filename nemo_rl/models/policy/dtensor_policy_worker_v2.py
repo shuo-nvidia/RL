@@ -69,6 +69,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
+    ChunkedDistributedGatherLogprob,
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.huggingface.common import (
@@ -1281,15 +1282,15 @@ class DTensorPolicyWorkerV2:
         k: int,
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[Any]:
-        """Return per-position top-k logits and corresponding global indices.
+        """Return per-position top-k logprobs and corresponding global indices.
 
         Notes:
         - Return shapes are [B, S, k].
         - Computes top-k over the full sequence (no trimming of the last position).
         - If alignment with next-token targets is required, the caller should handle it.
-        - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
+        - If logits are TP-sharded DTensor, performs distributed global top-k across TP and gathers logprobs.
         - Supports context parallelism with proper CP gather.
-        - Otherwise, computes local top-k on full-vocab tensor.
+        - Otherwise, computes local top-k on full-vocab logprobs tensor.
         """
         topk_batch_size = (
             micro_batch_size
@@ -1300,7 +1301,7 @@ class DTensorPolicyWorkerV2:
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
 
-        out_topk_vals = []
+        out_topk_logprobs = []
         out_topk_idx = []
         self.model.eval()
 
@@ -1433,7 +1434,7 @@ class DTensorPolicyWorkerV2:
                             )
 
                         # deal with TP first
-                        local_logits = logits.to_local()  # [B, S_cp, V_tp]
+                        local_logits = logits.to_local().to(torch.float32)  # [B, S_cp, V_tp]
 
                         tp_group = self.tp_mesh.get_group()
                         tp_rank = torch.distributed.get_rank(tp_group)
@@ -1441,44 +1442,69 @@ class DTensorPolicyWorkerV2:
                         vocab_start_index = tp_rank * V_local
                         vocab_end_index = (tp_rank + 1) * V_local
 
-                        vals, idx = distributed_vocab_topk(
+                        # Get top-k indices (monotonic between logits and logprobs)
+                        _, idx = distributed_vocab_topk(
                             local_logits,
                             k=k,
                             tp_group=tp_group,
                             vocab_start_index=vocab_start_index,
                             vocab_end_index=vocab_end_index,
                         )
-                        # [B, S_cp, k]
+
+                        # Gather distributed logprobs at those indices
+                        S_local = int(local_logits.shape[1])
+                        chunk_size = max(1, min(S_local, 1024))
+                        topk_logprobs_local = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+                            local_logits,
+                            idx,
+                            vocab_start_index,
+                            vocab_end_index,
+                            chunk_size,
+                            tp_group,
+                            False,
+                        )
 
                         cp_group = self.cp_mesh.get_group()
-
-                        vals = allgather_cp_sharded_tensor(
-                            vals, cp_group, seq_dim=sequence_dim
+                        topk_logprobs = allgather_cp_sharded_tensor(
+                            topk_logprobs_local, cp_group, seq_dim=sequence_dim
                         )
                         idx = allgather_cp_sharded_tensor(
                             idx, cp_group, seq_dim=sequence_dim
                         )
                         # [B, S, k]
                     else:
-                        # Compute top-k over full sequence length (do not drop last position)
+                        # Compute top-k logprobs over full sequence length
                         if isinstance(logits, DTensor):
-                            local_logits = logits.to_local()  # [B, S, V_local]
+                            local_logits = logits.to_local().to(torch.float32)  # [B, S, V_local]
                             tp_group = self.tp_mesh.get_group()
                             tp_rank = torch.distributed.get_rank(tp_group)
                             V_local = int(local_logits.shape[-1])
                             vocab_start_index = tp_rank * V_local
                             vocab_end_index = (tp_rank + 1) * V_local
 
-                            vals, idx = distributed_vocab_topk(
+                            # Get top-k indices and gather logprobs
+                            _, idx = distributed_vocab_topk(
                                 local_logits,
                                 k=k,
                                 tp_group=tp_group,
                                 vocab_start_index=vocab_start_index,
                                 vocab_end_index=vocab_end_index,
                             )
+                            S_len = int(local_logits.shape[1])
+                            chunk_size = max(1, min(S_len, 1024))
+                            topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+                                local_logits,
+                                idx,
+                                vocab_start_index,
+                                vocab_end_index,
+                                chunk_size,
+                                tp_group,
+                                False,
+                            )
                         else:
                             full_logits = logits.to(torch.float32)
-                            vals, idx = torch.topk(full_logits, k=k, dim=-1)
+                            log_probs = torch.nn.functional.log_softmax(full_logits, dim=-1)
+                            topk_logprobs, idx = torch.topk(log_probs, k=k, dim=-1)
 
                 # Handle sequence packing unpacking
                 if self.enable_seq_packing:
@@ -1487,10 +1513,10 @@ class DTensorPolicyWorkerV2:
                     # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
 
                     # Create tensors to store unpacked results
-                    unpacked_vals = torch.zeros(
+                    unpacked_logprobs = torch.zeros(
                         (original_batch_size, original_seq_len, k),
-                        dtype=vals.dtype,
-                        device=vals.device,
+                        dtype=topk_logprobs.dtype,
+                        device=topk_logprobs.device,
                     )
                     unpacked_idx = torch.zeros(
                         (original_batch_size, original_seq_len, k),
@@ -1507,12 +1533,12 @@ class DTensorPolicyWorkerV2:
                         seq_len_actual = input_lengths[i].item()
 
                         # Extract the corresponding portion from packed results
-                        # Note: vals and idx are [1, packed_seq_len, k] due to packing
-                        unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
+                        # Note: topk_logprobs and idx are [1, packed_seq_len, k] due to packing
+                        unpacked_logprobs[i, :seq_len_actual, :] = topk_logprobs[0, start:end, :]
                         unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
 
                     # Replace with unpacked results
-                    vals = unpacked_vals
+                    topk_logprobs = unpacked_logprobs
                     idx = unpacked_idx
 
                     # Update batch_size and seq_len for consistency
@@ -1521,15 +1547,15 @@ class DTensorPolicyWorkerV2:
 
                 # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
                 # Shapes remain [B, S, k].
-                out_topk_vals.append(vals.cpu())
+                out_topk_logprobs.append(topk_logprobs.cpu())
                 out_topk_idx.append(idx.cpu())
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
-        all_topk_vals_padded = []
+        all_topk_logprobs_padded = []
         all_topk_idx_padded = []
         target_seq_len = seq_dim_size
-        for vals, idx in zip(out_topk_vals, out_topk_idx):
+        for vals, idx in zip(out_topk_logprobs, out_topk_idx):
             pad_needed = target_seq_len - vals.shape[1]
             if pad_needed > 0:
                 # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
@@ -1539,13 +1565,13 @@ class DTensorPolicyWorkerV2:
                 idx = torch.nn.functional.pad(
                     idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
                 )
-            all_topk_vals_padded.append(vals)
+            all_topk_logprobs_padded.append(vals)
             all_topk_idx_padded.append(idx)
 
-        ret["topk_logits"] = (
-            torch.cat(all_topk_vals_padded, dim=0)
-            if len(all_topk_vals_padded) > 1
-            else all_topk_vals_padded[0]
+        ret["topk_logprobs"] = (
+            torch.cat(all_topk_logprobs_padded, dim=0)
+            if len(all_topk_logprobs_padded) > 1
+            else all_topk_logprobs_padded[0]
         ).cpu()
         ret["topk_indices"] = (
             torch.cat(all_topk_idx_padded, dim=0)
