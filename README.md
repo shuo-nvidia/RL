@@ -1,5 +1,7 @@
 # Nemo RL: A Scalable and Efficient Post-Training Library
 
+[![CICD NeMo RL](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml/badge.svg?branch=main&event=schedule)](https://github.com/NVIDIA-NeMo/RL/actions/workflows/cicd-main.yml)
+
 ## 📣 News
 * [9/25/2025] On-policy Distillation (Qwen3-style)
     * Student generates on-policy sequences and aligns logits to a larger teacher via KL, achieving near-larger-model quality at lower cost than RL. See [On-policy Distillation](#on-policy-distillation).
@@ -358,7 +360,7 @@ sbatch \
 
 ## Supervised Fine-Tuning (SFT)
 
-We provide an example SFT experiment using the [SQuAD dataset](https://rajpurkar.github.io/SQuAD-explorer/).
+We provide example SFT experiments using various datasets including [SQuAD](https://rajpurkar.github.io/SQuAD-explorer/), OpenAI format datasets (with tool calling support), and custom JSONL datasets. For detailed documentation on supported datasets and configurations, see the [SFT documentation](docs/guides/sft.md).
 
 ### SFT Single Node
 
@@ -566,7 +568,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 
 ## Tips and Tricks
 - If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:
-  
+
   ```sh
   ModuleNotFoundError: No module named 'megatron'
   ```
