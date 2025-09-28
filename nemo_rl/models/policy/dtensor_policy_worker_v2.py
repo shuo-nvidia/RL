@@ -66,9 +66,9 @@ from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.loss_functions import SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedGatherLogprob,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
-    ChunkedDistributedGatherLogprob,
     get_logprobs_from_vocab_parallel_logits,
 )
 from nemo_rl.models.huggingface.common import (
@@ -1460,7 +1460,9 @@ class DTensorPolicyWorkerV2:
                             )
 
                         # deal with TP first
-                        local_logits = logits.to_local().to(torch.float32)  # [B, S_cp, V_tp]
+                        local_logits = logits.to_local().to(
+                            torch.float32
+                        )  # [B, S_cp, V_tp]
 
                         tp_group = self.tp_mesh.get_group()
                         tp_rank = torch.distributed.get_rank(tp_group)
@@ -1501,7 +1503,9 @@ class DTensorPolicyWorkerV2:
                     else:
                         # Compute top-k logprobs over full sequence length
                         if isinstance(logits, DTensor):
-                            local_logits = logits.to_local().to(torch.float32)  # [B, S, V_local]
+                            local_logits = logits.to_local().to(
+                                torch.float32
+                            )  # [B, S, V_local]
                             tp_group = self.tp_mesh.get_group()
                             tp_rank = torch.distributed.get_rank(tp_group)
                             V_local = int(local_logits.shape[-1])
@@ -1529,7 +1533,9 @@ class DTensorPolicyWorkerV2:
                             )
                         else:
                             full_logits = logits.to(torch.float32)
-                            log_probs = torch.nn.functional.log_softmax(full_logits, dim=-1)
+                            log_probs = torch.nn.functional.log_softmax(
+                                full_logits, dim=-1
+                            )
                             topk_logprobs, idx = torch.topk(log_probs, k=k, dim=-1)
 
                 # Handle sequence packing unpacking
@@ -1560,7 +1566,9 @@ class DTensorPolicyWorkerV2:
 
                         # Extract the corresponding portion from packed results
                         # Note: topk_logprobs and idx are [1, packed_seq_len, k] due to packing
-                        unpacked_logprobs[i, :seq_len_actual, :] = topk_logprobs[0, start:end, :]
+                        unpacked_logprobs[i, :seq_len_actual, :] = topk_logprobs[
+                            0, start:end, :
+                        ]
                         unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
 
                     # Replace with unpacked results
@@ -1594,7 +1602,7 @@ class DTensorPolicyWorkerV2:
             all_topk_logprobs_padded.append(vals)
             all_topk_idx_padded.append(idx)
 
-        ret["topk_logprobs"] = (
+        ret["topk_logits"] = (
             torch.cat(all_topk_logprobs_padded, dim=0)
             if len(all_topk_logprobs_padded) > 1
             else all_topk_logprobs_padded[0]
