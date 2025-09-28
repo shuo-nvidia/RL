@@ -1594,7 +1594,7 @@ class DTensorPolicyWorkerV2:
             if pad_needed > 0:
                 # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
                 vals = torch.nn.functional.pad(
-                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=float("-inf")
                 )
                 idx = torch.nn.functional.pad(
                     idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0

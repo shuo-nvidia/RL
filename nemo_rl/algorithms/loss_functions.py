@@ -871,6 +871,8 @@ class DistillationLossFn(LossFunction):
         input_ids = data["input_ids"]
         batch_size = input_ids.shape[0]
 
+        print("next_token_logits has NaN:", torch.isnan(next_token_logits).any())
+
         # CP support: get CP group and size
         cp_group = context_parallel_group
         cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
@@ -968,6 +970,16 @@ class DistillationLossFn(LossFunction):
             student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
         )
 
+        print("student_topk_logprobs has NaN:", torch.isnan(student_topk_logprobs).any())
+        print("student_topk_logprobs has Inf:", torch.isinf(student_topk_logprobs).any())
+        print("teacher_topk_logprobs has NaN:", torch.isnan(teacher_topk_logprobs).any())
+        print("teacher_topk_logprobs has +Inf:", torch.isposinf(teacher_topk_logprobs).any())
+        print("teacher_topk_logprobs has -Inf:", torch.isneginf(teacher_topk_logprobs).any())
+
+        # vocab_size = next_token_logits.shape[-1]
+        # bad = (teacher_topk_indices < 0) | (teacher_topk_indices >= vocab_size)
+        # print("out-of-range idx:", bad.any())
+
         # Single point of next-token alignment after TP/CP processing
         teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
         student_topk_logprobs = student_topk_logprobs[:, :-1, :]
@@ -975,14 +987,22 @@ class DistillationLossFn(LossFunction):
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
-        student_ghost_token_prob = (1.0 - student_probs.sum(-1)).unsqueeze(
-            -1
-        )  # [B, S-1, 1]
-        teacher_ghost_token_prob = (1.0 - teacher_probs.sum(-1)).unsqueeze(
-            -1
-        )  # [B, S-1, 1]
+        # 数值稳定：sum 可能略微超过 1 或出现负 ghost 概率，另外 log(0) 会变 -inf
+        _eps = 1e-12
+        student_ghost_token_prob = (
+            1.0 - student_probs.sum(-1)
+        ).clamp(min=0.0, max=1.0).clamp_min(_eps).unsqueeze(-1)  # [B, S-1, 1]
+        teacher_ghost_token_prob = (
+            1.0 - teacher_probs.sum(-1)
+        ).clamp(min=0.0, max=1.0).clamp_min(_eps).unsqueeze(-1)  # [B, S-1, 1]
         student_ghost_token_logprob = torch.log(student_ghost_token_prob)  # [B, S-1, 1]
         teacher_ghost_token_logprob = torch.log(teacher_ghost_token_prob)  # [B, S-1, 1]
+
+        # add some debug print for ghost token to verfiy the value is correct
+        print(f"student_ghost_token_prob: {student_ghost_token_prob[:2, :20, :]}")
+        print(f"teacher_ghost_token_prob: {teacher_ghost_token_prob[:2, :20, :]}")
+        # print(f"student_ghost_token_logprob: {student_ghost_token_logprob}")
+        # print(f"teacher_ghost_token_logprob: {teacher_ghost_token_logprob}")
 
         # Append ghost token
         student_topk_logprobs = torch.cat(
