@@ -23,12 +23,10 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs,
-    gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
 )
 
@@ -881,7 +879,7 @@ class DistillationLossFn(LossFunction):
         next_token_logits = next_token_logits.to(torch.float32)
         per_token_kl = None
         # Preferred truncated-KL path: teacher provides top-k support per position
-        teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
+        teacher_topk_logprobs = data["teacher_topk_logits"]  # [B, S, k]
         teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
 
         if teacher_topk_indices.shape[-1] <= 0:
@@ -926,7 +924,7 @@ class DistillationLossFn(LossFunction):
             logits_tensor = next_token_logits
 
         # Process based on zero_outside_topk setting
-        if self.zero_outside_topk and parallel_group is not None:
+        if parallel_group is not None:
             # Distributed processing with chunking
             indices_local = teacher_topk_indices
             pad_len = 0
@@ -953,85 +951,48 @@ class DistillationLossFn(LossFunction):
                 False,
             )
 
-            if self.kl_type != "forward":
-                H_all = ChunkedDistributedEntropy.apply(  # type: ignore
-                    logits_tensor,
-                    chunk_size,
-                    parallel_group,
-                    False,
-                )
-
             if cp_size > 1:
                 student_topk_logprobs = allgather_cp_sharded_tensor(
                     student_topk_logprobs, cp_group, seq_dim=1
                 )
-                if self.kl_type != "forward":
-                    H_all = allgather_cp_sharded_tensor(H_all, cp_group, seq_dim=1)
                 if pad_len > 0:
                     student_topk_logprobs = student_topk_logprobs[:, :-pad_len, :]
-                    if self.kl_type != "forward":
-                        H_all = H_all[:, :-pad_len]
-        elif self.zero_outside_topk:
-            # Non-distributed processing
+        else:
             student_logprobs = torch.nn.functional.log_softmax(logits_tensor, dim=-1)
             student_topk_logprobs = student_logprobs.gather(
                 dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
             )
-            if self.kl_type != "forward":
-                H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
-        else:
-            # Gather logits at global indices
-            if (parallel_group is not None) or (cp_size > 1):
-                student_topk_logits = gather_logits_at_global_indices(
-                    logits_tensor,
-                    teacher_topk_indices,
-                    tp_group=parallel_group,
-                    cp_group=cp_group,
-                    vocab_start_index=(
-                        vocab_start_index if parallel_group is not None else 0
-                    ),
-                    vocab_end_index=(
-                        vocab_end_index
-                        if parallel_group is not None
-                        else int(logits_tensor.shape[-1])
-                    ),
-                )
-            else:
-                student_topk_logits = logits_tensor.gather(
-                    dim=-1, index=teacher_topk_indices.to(logits_tensor.device)
-                )
-            student_topk_logprobs = torch.nn.functional.log_softmax(
-                student_topk_logits, dim=-1
-            )
 
         # Move teacher tensors to the same device/dtype as student_topk_logits
-        teacher_topk_logits = teacher_topk_logits.to(
+        teacher_topk_logprobs = teacher_topk_logprobs.to(
             student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
-        )
-        teacher_topk_logprobs = torch.nn.functional.log_softmax(
-            teacher_topk_logits, dim=-1
         )
 
         # Single point of next-token alignment after TP/CP processing
         teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
         student_topk_logprobs = student_topk_logprobs[:, :-1, :]
-        if self.zero_outside_topk and self.kl_type != "forward":
-            # Align H_all with next-token prediction
-            H_all = H_all[:, :-1]
 
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
-        loss_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
-        if self.zero_outside_topk and self.kl_type != "forward":
-            H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
-            P_rest = 1 - (student_probs.sum(-1))
-            # The entropy and prob of the rest of the tokens [B, S-1]
-            loss_correction_term = H_rest - self.log_infinitesimal * P_rest  # [B, S-1]
-            if self.kl_type == "mixed":
-                loss_correction_term = loss_correction_term * (
-                    1.0 - self.mixed_kl_weight
-                )
+        student_ghost_token_prob = (1.0 - student_probs.sum(-1)).unsqueeze(
+            -1
+        )  # [B, S-1, 1]
+        teacher_ghost_token_prob = (1.0 - teacher_probs.sum(-1)).unsqueeze(
+            -1
+        )  # [B, S-1, 1]
+        student_ghost_token_logprob = torch.log(student_ghost_token_prob)  # [B, S-1, 1]
+        teacher_ghost_token_logprob = torch.log(teacher_ghost_token_prob)  # [B, S-1, 1]
+
+        # Append ghost token
+        student_topk_logprobs = torch.cat(
+            [student_topk_logprobs, student_ghost_token_logprob], dim=-1
+        )
+        teacher_topk_logprobs = torch.cat(
+            [teacher_topk_logprobs, teacher_ghost_token_logprob], dim=-1
+        )
+        student_probs = torch.cat([student_probs, student_ghost_token_prob], dim=-1)
+        teacher_probs = torch.cat([teacher_probs, teacher_ghost_token_prob], dim=-1)
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
@@ -1050,7 +1011,7 @@ class DistillationLossFn(LossFunction):
                 + (1.0 - self.mixed_kl_weight) * kl_reverse
             )
 
-        per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
+        per_token_kl = per_token_kl.sum(dim=-1)  # [B, S-1]
 
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:
