@@ -20,12 +20,14 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.distillation import (
     _default_distillation_save_state,
+    check_vocab_equality,
     distillation_train,
     validate,
 )
 from nemo_rl.algorithms.loss_functions import DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+import nemo_rl.algorithms.distillation as distil_mod
 
 
 @pytest.fixture
@@ -228,3 +230,116 @@ def test_validate_function(mock_components):
     # For distillation, we don't need environment interaction since max_rollout_turns=0
     # The validation focuses on generation and teacher-student knowledge transfer
     # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
+
+
+def test_check_vocab_equality_pass(monkeypatch):
+    student_tokenizer = MagicMock()
+    student_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
+    student_tokenizer.__len__.return_value = 2
+
+    teacher_tokenizer = MagicMock()
+    teacher_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
+    teacher_tokenizer.__len__.return_value = 2
+
+    student_config = MagicMock()
+    student_config.vocab_size = 2
+    teacher_config = MagicMock()
+    teacher_config.vocab_size = 2
+
+    monkeypatch.setattr(
+        distil_mod.AutoTokenizer,
+        "from_pretrained",
+        lambda name: teacher_tokenizer,
+    )
+    monkeypatch.setattr(
+        distil_mod.AutoConfig,
+        "from_pretrained",
+        lambda name: student_config if name == "student-model" else teacher_config,
+    )
+
+    # Should not raise
+    check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
+
+
+def test_check_vocab_equality_vocab_mismatch_raises(monkeypatch):
+    student_tokenizer = MagicMock()
+    student_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
+    student_tokenizer.__len__.return_value = 2
+
+    teacher_tokenizer = MagicMock()
+    teacher_tokenizer.get_vocab.return_value = {"a": 0, "c": 2}
+    teacher_tokenizer.__len__.return_value = 2
+
+    student_config = MagicMock(); student_config.vocab_size = 2
+    teacher_config = MagicMock(); teacher_config.vocab_size = 2
+
+    monkeypatch.setattr(
+        distil_mod.AutoTokenizer,
+        "from_pretrained",
+        lambda name: teacher_tokenizer,
+    )
+    monkeypatch.setattr(
+        distil_mod.AutoConfig,
+        "from_pretrained",
+        lambda name: student_config if name == "student-model" else teacher_config,
+    )
+
+    with pytest.raises(AssertionError):
+        check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
+
+
+def test_check_vocab_equality_length_mismatch_raises(monkeypatch):
+    # Same vocab mapping but different __len__ values
+    vocab = {"a": 0, "b": 1}
+    student_tokenizer = MagicMock()
+    student_tokenizer.get_vocab.return_value = vocab
+    student_tokenizer.__len__.return_value = 2
+
+    teacher_tokenizer = MagicMock()
+    teacher_tokenizer.get_vocab.return_value = vocab
+    teacher_tokenizer.__len__.return_value = 3
+
+    student_config = MagicMock(); student_config.vocab_size = 2
+    teacher_config = MagicMock(); teacher_config.vocab_size = 2
+
+    monkeypatch.setattr(
+        distil_mod.AutoTokenizer,
+        "from_pretrained",
+        lambda name: teacher_tokenizer,
+    )
+    monkeypatch.setattr(
+        distil_mod.AutoConfig,
+        "from_pretrained",
+        lambda name: student_config if name == "student-model" else teacher_config,
+    )
+
+    with pytest.raises(AssertionError):
+        check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
+
+
+def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
+    vocab = {"a": 0, "b": 1}
+    student_tokenizer = MagicMock()
+    student_tokenizer.get_vocab.return_value = vocab
+    student_tokenizer.__len__.return_value = 2
+
+    teacher_tokenizer = MagicMock()
+    teacher_tokenizer.get_vocab.return_value = vocab
+    teacher_tokenizer.__len__.return_value = 2
+
+    student_config = MagicMock(); student_config.vocab_size = 2
+    teacher_config = MagicMock(); teacher_config.vocab_size = 3
+
+    monkeypatch.setattr(
+        distil_mod.AutoTokenizer,
+        "from_pretrained",
+        lambda name: teacher_tokenizer,
+    )
+    monkeypatch.setattr(
+        distil_mod.AutoConfig,
+        "from_pretrained",
+        lambda name: student_config if name == "student-model" else teacher_config,
+    )
+
+    with pytest.raises(AssertionError):
+        check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
