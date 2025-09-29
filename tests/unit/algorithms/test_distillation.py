@@ -18,6 +18,7 @@ import pytest
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
     _default_distillation_save_state,
     check_vocab_equality,
@@ -27,7 +28,6 @@ from nemo_rl.algorithms.distillation import (
 from nemo_rl.algorithms.loss_functions import DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-import nemo_rl.algorithms.distillation as distil_mod
 
 
 @pytest.fixture
@@ -270,8 +270,10 @@ def test_check_vocab_equality_vocab_mismatch_raises(monkeypatch):
     teacher_tokenizer.get_vocab.return_value = {"a": 0, "c": 2}
     teacher_tokenizer.__len__.return_value = 2
 
-    student_config = MagicMock(); student_config.vocab_size = 2
-    teacher_config = MagicMock(); teacher_config.vocab_size = 2
+    student_config = MagicMock()
+    student_config.vocab_size = 2
+    teacher_config = MagicMock()
+    teacher_config.vocab_size = 2
 
     monkeypatch.setattr(
         distil_mod.AutoTokenizer,
@@ -299,8 +301,10 @@ def test_check_vocab_equality_length_mismatch_raises(monkeypatch):
     teacher_tokenizer.get_vocab.return_value = vocab
     teacher_tokenizer.__len__.return_value = 3
 
-    student_config = MagicMock(); student_config.vocab_size = 2
-    teacher_config = MagicMock(); teacher_config.vocab_size = 2
+    student_config = MagicMock()
+    student_config.vocab_size = 2
+    teacher_config = MagicMock()
+    teacher_config.vocab_size = 2
 
     monkeypatch.setattr(
         distil_mod.AutoTokenizer,
@@ -327,8 +331,10 @@ def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
     teacher_tokenizer.get_vocab.return_value = vocab
     teacher_tokenizer.__len__.return_value = 2
 
-    student_config = MagicMock(); student_config.vocab_size = 2
-    teacher_config = MagicMock(); teacher_config.vocab_size = 3
+    student_config = MagicMock()
+    student_config.vocab_size = 2
+    teacher_config = MagicMock()
+    teacher_config.vocab_size = 3
 
     monkeypatch.setattr(
         distil_mod.AutoTokenizer,

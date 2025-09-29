@@ -37,6 +37,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     distillation.max_val_samples=16 \
     distillation.val_batch_size=8 \
     distillation.val_period=3 \
+    data.dataset_name=OpenMathInstruct-2 \
     loss_fn.zero_outside_topk=true \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
