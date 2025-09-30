@@ -15,6 +15,10 @@ loss_fn:
     kl_type: "mixed" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
     zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
+    align_correlation: true # whether to enable alignment correction term
+    smooth_correction: true # whether to use smooth correction for alignment correction term
+    sample_level_correlation: true # whether to enable sample level weighting based on teacher PPL
+    token_level_correlation: true # whether to enable token level weighting based on student not in teacher count
 
 checkpointing:
     enabled: true

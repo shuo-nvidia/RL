@@ -639,6 +639,10 @@ def distillation_train(
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    
+                    if master_config["distillation"].get("sample_level_correlation", False):
+                        teacher_rollout_logprobs = teacher_policy.get_logprobs(train_data)
+                        train_data["teacher_rollout_logprobs"] = teacher_rollout_logprobs["logprobs"]
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):

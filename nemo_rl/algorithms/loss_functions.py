@@ -25,6 +25,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
+    ChunkedDistributedTopkLogits,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs,
@@ -832,7 +833,12 @@ class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
-
+    align_correlation: bool
+    token_level_correlation: bool
+    sample_level_correlation: bool  # whether to enable sample level weighting based on teacher PPL
+    adaptive_weight_min_clamp: float  # minimum value limit for weights
+    adaptive_weight_max_clamp: float  # maximum value limit for weights
+    smooth_correction: bool  # whether to use smooth correction for alignment correction term
 
 class DistillationLossDataDict(TypedDict):
     input_ids: torch.Tensor
@@ -841,6 +847,7 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    teacher_rollout_logprobs: NotRequired[torch.Tensor]  # teacher's logprobs on student's rollout path, for PPL calculation
 
 
 class DistillationLossFn(LossFunction):
@@ -850,6 +857,12 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.align_correlation = cfg.get("align_correlation", True)
+        self.token_level_correlation = cfg.get("token_level_correlation", True)
+        self.sample_level_correlation = cfg.get("sample_level_correlation", True)
+        self.adaptive_weight_min_clamp = cfg.get("adaptive_weight_min_clamp", 0.2)
+        self.adaptive_weight_max_clamp = cfg.get("adaptive_weight_max_clamp", 5.0)
+        self.smooth_correction = cfg.get("smooth_correction", True)
         self.log_infinitesimal = -100
         self.loss_type = LossType.TOKEN_LEVEL
 
@@ -925,84 +938,30 @@ class DistillationLossFn(LossFunction):
             parallel_group = None
             logits_tensor = next_token_logits
 
-        # Process based on zero_outside_topk setting
-        if self.zero_outside_topk and parallel_group is not None:
-            # Distributed processing with chunking
-            indices_local = teacher_topk_indices
-            pad_len = 0
-            if cp_size > 1:
-                pad_len = logits_tensor.shape[1] * cp_size - indices_local.shape[1]
-                if pad_len > 0:
-                    indices_local = torch.nn.functional.pad(
-                        indices_local, (0, 0, 0, pad_len), value=0
-                    )
-                cp_rank = torch.distributed.get_rank(cp_group)
-                indices_local = _get_tokens_on_this_cp_rank(
-                    indices_local, cp_rank, cp_size, seq_dim=1
-                )
-
-            S_local = int(logits_tensor.shape[1])
-            chunk_size = max(1, min(S_local, 1024))
-            student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+        
+        # Gather logits at global indices
+        if (parallel_group is not None) or (cp_size > 1):
+            student_topk_logits = gather_logits_at_global_indices(
                 logits_tensor,
-                indices_local,
-                vocab_start_index,
-                vocab_end_index,
-                chunk_size,
-                parallel_group,
-                False,
+                teacher_topk_indices,
+                tp_group=parallel_group,
+                cp_group=cp_group,
+                vocab_start_index=(
+                    vocab_start_index if parallel_group is not None else 0
+                ),
+                vocab_end_index=(
+                    vocab_end_index
+                    if parallel_group is not None
+                    else int(logits_tensor.shape[-1])
+                ),
             )
-
-            if self.kl_type != "forward":
-                H_all = ChunkedDistributedEntropy.apply(  # type: ignore
-                    logits_tensor,
-                    chunk_size,
-                    parallel_group,
-                    False,
-                )
-
-            if cp_size > 1:
-                student_topk_logprobs = allgather_cp_sharded_tensor(
-                    student_topk_logprobs, cp_group, seq_dim=1
-                )
-                if self.kl_type != "forward":
-                    H_all = allgather_cp_sharded_tensor(H_all, cp_group, seq_dim=1)
-                if pad_len > 0:
-                    student_topk_logprobs = student_topk_logprobs[:, :-pad_len, :]
-                    if self.kl_type != "forward":
-                        H_all = H_all[:, :-pad_len]
-        elif self.zero_outside_topk:
-            # Non-distributed processing
-            student_logprobs = torch.nn.functional.log_softmax(logits_tensor, dim=-1)
-            student_topk_logprobs = student_logprobs.gather(
-                dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
-            )
-            if self.kl_type != "forward":
-                H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
         else:
-            # Gather logits at global indices
-            if (parallel_group is not None) or (cp_size > 1):
-                student_topk_logits = gather_logits_at_global_indices(
-                    logits_tensor,
-                    teacher_topk_indices,
-                    tp_group=parallel_group,
-                    cp_group=cp_group,
-                    vocab_start_index=(
-                        vocab_start_index if parallel_group is not None else 0
-                    ),
-                    vocab_end_index=(
-                        vocab_end_index
-                        if parallel_group is not None
-                        else int(logits_tensor.shape[-1])
-                    ),
-                )
-            else:
-                student_topk_logits = logits_tensor.gather(
-                    dim=-1, index=teacher_topk_indices.to(logits_tensor.device)
-                )
-            student_topk_logprobs = torch.nn.functional.log_softmax(
-                student_topk_logits, dim=-1
+            student_topk_logits = logits_tensor.gather(
+                dim=-1, index=teacher_topk_indices.to(logits_tensor.device)
             )
+        student_topk_logprobs = torch.nn.functional.log_softmax(
+            student_topk_logits, dim=-1
+        )
 
         # Move teacher tensors to the same device/dtype as student_topk_logits
         teacher_topk_logits = teacher_topk_logits.to(
@@ -1015,23 +974,25 @@ class DistillationLossFn(LossFunction):
         # Single point of next-token alignment after TP/CP processing
         teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
         student_topk_logprobs = student_topk_logprobs[:, :-1, :]
-        if self.zero_outside_topk and self.kl_type != "forward":
-            # Align H_all with next-token prediction
-            H_all = H_all[:, :-1]
 
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
-        loss_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
-        if self.zero_outside_topk and self.kl_type != "forward":
-            H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
-            P_rest = 1 - (student_probs.sum(-1))
-            # The entropy and prob of the rest of the tokens [B, S-1]
-            loss_correction_term = H_rest - self.log_infinitesimal * P_rest  # [B, S-1]
-            if self.kl_type == "mixed":
-                loss_correction_term = loss_correction_term * (
-                    1.0 - self.mixed_kl_weight
-                )
+
+
+        # Compute alignment correction term if enabled
+        align_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
+        student_not_in_teacher_count = None
+        if self.align_correlation:
+            align_correction_term, student_not_in_teacher_count = self._compute_align_correction(
+                logits_tensor,  
+                teacher_topk_indices, 
+                parallel_group,
+                cp_group,
+                cp_size,
+                None,  
+            )
+        
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
@@ -1050,16 +1011,65 @@ class DistillationLossFn(LossFunction):
                 + (1.0 - self.mixed_kl_weight) * kl_reverse
             )
 
-        per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
+        per_token_kl = per_token_kl.sum(dim=-1) + align_correction_term  # [B, S-1]
+        
+        # Apply adaptive weighting based on alignment if enabled
+        if self.token_level_correlation is not None:
+            # get token mask for correct handling of pad positions
+            token_mask_for_weights = None
+            if "token_mask" in data:
+                token_mask_for_weights = data["token_mask"][:, 1:]  # remove the first token, match [B, S-1]
+                # ensure mask length consistent with per_token_kl
+                max_len = per_token_kl.shape[1]
+                token_mask_for_weights = token_mask_for_weights[:, :max_len]
+            
 
-        # Masking and reduction
+            teacher_k = teacher_topk_indices.shape[-1]
+
+            adaptive_weights = self._compute_token_level_adaptive_weights(
+                student_not_in_teacher_count,
+                teacher_k=teacher_k,
+                token_mask=token_mask_for_weights,
+            )
+            
+            per_token_kl = per_token_kl * adaptive_weights
+
+        # Apply sample-level weighting based on teacher PPL if enabled
+        sample_level_weights = None
+        if (self.sample_level_correlation and 
+            "teacher_rollout_logprobs" in data and 
+            "token_mask" in data and 
+            "sample_mask" in data):
+            
+            teacher_rollout_logprobs = data["teacher_rollout_logprobs"][:, 1:]  # remove the first token
+            token_mask_for_ppl = data["token_mask"][:, 1:]
+            sample_mask_for_ppl = data["sample_mask"]
+            
+            # ensure length consistent
+            max_len = per_token_kl.shape[1]
+            teacher_rollout_logprobs = teacher_rollout_logprobs[:, :max_len]
+            token_mask_for_ppl = token_mask_for_ppl[:, :max_len]
+            
+            sample_level_weights = self._compute_sample_level_ppl_weights(
+                teacher_rollout_logprobs,
+                token_mask_for_ppl,
+                sample_mask_for_ppl,
+                temperature=1.0  # can be as a hyper-parameter
+            )
+
+        # masking and reduction
         if "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
             sample_mask = data["sample_mask"]
-            # Align mask length to current per_token_kl
+            # align mask length to current per_token_kl
             max_len = per_token_kl.shape[1]
             token_mask = token_mask[:, :max_len]
             mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+            
+            # if sample level weights are provided, apply to mask
+            if sample_level_weights is not None:
+                mask = mask * sample_level_weights.unsqueeze(-1)  # [B, S-1]
+            
             # align mask shape to per_token_kl
             kl_loss = masked_mean(
                 per_token_kl,
@@ -1069,9 +1079,269 @@ class DistillationLossFn(LossFunction):
         else:
             kl_loss = per_token_kl.mean()
 
+        # compute average of student not in teacher per token
+        if "token_mask" in data and "sample_mask" in data:
+            # use the same mask to compute average
+            max_len = student_not_in_teacher_count.shape[1]
+            token_mask_for_metric = data["token_mask"][:, 1:]  # remove the first token, match [B, S-1]
+
+            sample_mask_for_metric = data["sample_mask"]
+            mask_for_metric = token_mask_for_metric * sample_mask_for_metric.unsqueeze(-1)
+            
+            student_not_in_teacher_per_token = masked_mean(
+                student_not_in_teacher_count,
+                mask_for_metric,
+                global_normalization_factor=None,  # use local average
+            )
+        else:
+            student_not_in_teacher_per_token = student_not_in_teacher_count.mean()
+
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "num_valid_samples": int(batch_size),
+            "student_not_in_teacher_per_token": float(student_not_in_teacher_per_token.item()),
         }
 
         return kl_loss, metrics
+
+    def _compute_align_correction(
+        self,
+        student_logits: torch.Tensor,  # [B, S-1, V_local]
+        teacher_topk_indices: torch.Tensor,  # [B, S-1, k]
+        parallel_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        cp_size: int,
+        chunk_size: Optional[int],
+    ) -> torch.Tensor:
+        """
+        Compute alignment correction term: student does global softmax and topk,
+        select the tokens in student topk that are not in teacher topk, and compute the sum of probabilities of these tokens in student global softmax.
+        
+        Args:
+            student_logits: Student model's logits [B, S-1, V_local]
+            teacher_topk_indices: Teacher's top-k indices [B, S-1, k]
+            parallel_group: Tensor parallel group
+            cp_group: Context parallel group
+            cp_size: Context parallel size
+            vocab_start_index: Vocabulary start index
+            vocab_end_index: Vocabulary end index
+            
+        Returns:
+            align_correction_term: Alignment correction term [B, S-1]
+            student_not_in_teacher_count: Number of tokens in student topk that are not in teacher topk [B, S-1]
+        """
+        smooth_correction = self.smooth_correction
+
+        B, S_minus_1, V_local = student_logits.shape
+        k_teacher = teacher_topk_indices.shape[-1]
+        
+        # use the same k value for student's topk calculation
+        k_student = k_teacher
+        
+        if parallel_group is not None:
+            # Distributed case: use ChunkedDistributedTopkLogits
+            chunk_size = max(1, min(S_minus_1, 1024)) if chunk_size is None else chunk_size
+            
+            # Process context parallel
+            pad_len = 0
+            if cp_size > 1:
+                pad_len = student_logits.shape[1] * cp_size - teacher_topk_indices.shape[1]
+                if pad_len > 0:
+                    teacher_topk_indices = torch.nn.functional.pad(
+                        teacher_topk_indices, (0, 0, 0, pad_len), value=0
+                    )
+                cp_rank = torch.distributed.get_rank(cp_group)
+                teacher_topk_indices = _get_tokens_on_this_cp_rank(
+                    teacher_topk_indices, cp_rank, cp_size, seq_dim=1
+                )
+            
+            # Get student's global top-k
+            student_topk_indices, student_topk_probs = ChunkedDistributedTopkLogits.apply(
+                student_logits,
+                chunk_size,
+                parallel_group,
+                k_student,
+                False, 
+            )
+            
+            # Restore context parallel processing
+            if cp_size > 1:
+                student_topk_indices = allgather_cp_sharded_tensor(
+                    student_topk_indices, cp_group, seq_dim=1
+                )
+                student_topk_probs = allgather_cp_sharded_tensor(
+                    student_topk_probs, cp_group, seq_dim=1
+                )
+                teacher_topk_indices = allgather_cp_sharded_tensor(
+                    teacher_topk_indices, cp_group, seq_dim=1
+                )
+                if pad_len > 0:
+                    student_topk_indices = student_topk_indices[:, :-pad_len, :]
+                    student_topk_probs = student_topk_probs[:, :-pad_len, :]
+                    teacher_topk_indices = teacher_topk_indices[:, :-pad_len, :]
+            else:
+                teacher_topk_indices = teacher_topk_indices
+                
+        else:
+            # non-distributed case
+            student_probs_full = torch.nn.functional.softmax(student_logits, dim=-1)
+            student_topk_probs, student_topk_indices = torch.topk(
+                student_probs_full, k_student, dim=-1
+            )
+            teacher_topk_indices = teacher_topk_indices
+        
+        student_topk_indices = student_topk_indices[:, :-1, :]
+        teacher_topk_indices = teacher_topk_indices[:, :-1, :]
+        student_topk_probs = student_topk_probs[:, :-1, :]
+
+        # find tokens in student topk that are not in teacher topk
+        # student_topk_indices: [B, S-1, k], teacher_topk_indices: [B, S-1, k]
+        
+        # expand dimensions for comparison
+        student_indices_expanded = student_topk_indices.unsqueeze(-1)  # [B, S-1, k, 1]
+        teacher_indices_expanded = teacher_topk_indices.unsqueeze(-2)  # [B, S-1, 1, k]
+        
+        # check if each top-k index in student is in teacher's top-k
+        matches = (student_indices_expanded == teacher_indices_expanded)  # [B, S-1, k, k]
+        is_in_teacher = matches.any(dim=-1)  # [B, S-1, k]
+        
+        # find tokens in student topk that are not in teacher topk
+        not_in_teacher = ~is_in_teacher  # [B, S-1, k]
+        
+        # compute sum of probabilities of tokens not in teacher topk
+        correction_probs = student_topk_probs * not_in_teacher.float()  # [B, S-1, k]
+        align_correction_term = correction_probs.sum(dim=-1)  # [B, S-1]
+        
+        # compute number of tokens in student topk that are not in teacher topk
+        student_not_in_teacher_count = not_in_teacher.sum(dim=-1).float()  # [B, S-1]
+        
+        if self.smooth_correction:
+            align_correction_term = 2 * torch.pow(align_correction_term, 3) - torch.pow(align_correction_term, 4)
+        else:
+            eps = 1e-8  # avoid log(0)
+            x = torch.clamp(align_correction_term, min=eps)
+            align_correction_term = -x * torch.log(x) + 0.5 * align_correction_term
+        
+        return align_correction_term, student_not_in_teacher_count
+    
+    def _compute_token_level_adaptive_weights(
+        self,
+        student_not_in_teacher_count: torch.Tensor,
+        teacher_k: int,
+        token_mask: Optional[torch.Tensor] = None,
+        temperature: float = 1.0
+    ) -> torch.Tensor:
+        """
+        Alternative implementation of adaptive weights using softmax method.
+        
+        Args:
+            student_not_in_teacher_count: number of tokens in student topk that are not in teacher topk [B, S-1]
+            teacher_k: teacher's topk value, for normalization
+            token_mask: token validity mask [B, S-1]
+            temperature: softmax temperature parameter, control the sharpness of the weight distribution
+            
+        Returns:
+            adaptive_weights: adaptive weights [B, S-1]
+        """
+        # if no mask is provided, create a mask of all 1s
+        if token_mask is None:
+            token_mask = torch.ones_like(student_not_in_teacher_count)
+        
+        # normalize to [0,1] range
+        normalized_scores = student_not_in_teacher_count.float() / teacher_k  # [B, S-1]
+        
+        # apply temperature parameter
+        scaled_scores = normalized_scores / temperature
+        
+        # set small value for pad positions
+        masked_scores = torch.where(
+            token_mask.bool(),
+            scaled_scores,
+            torch.full_like(scaled_scores, -1e9)  # set small value for pad positions
+        )
+        
+        # compute softmax weights
+        softmax_weights = torch.softmax(masked_scores, dim=1)  # [B, S-1]
+        
+        # ensure weights are 0 for pad positions
+        softmax_weights = softmax_weights * token_mask
+        
+        # re-normalize to sequence length, keep total loss
+        valid_token_count = token_mask.sum(dim=1, keepdim=True)  # [B, 1]
+        valid_token_count = torch.clamp(valid_token_count, min=1e-8)
+        
+        # re-normalize to valid token count
+        adaptive_weights = softmax_weights * valid_token_count
+        
+        # apply clamp, avoid extreme weights
+        adaptive_weights = torch.clamp(
+            adaptive_weights, 
+            min=self.adaptive_weight_min_clamp, 
+            max=self.adaptive_weight_max_clamp
+        )
+
+        # apply token_mask again, ensure weights are 0 for pad positions
+        adaptive_weights = adaptive_weights * token_mask
+        
+        return adaptive_weights
+    
+    def _compute_sample_level_ppl_weights(
+        self,
+        teacher_rollout_logprobs: torch.Tensor,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        temperature: float = 1.0
+    ) -> torch.Tensor:
+        """
+        Compute sample-level weights based on teacher's perplexity on student's rollout path.
+        
+        Args:
+            teacher_rollout_logprobs: teacher's logprobs on student's rollout path [B, S-1]
+            token_mask: token validity mask [B, S-1]
+            sample_mask: sample validity mask [B]
+            temperature: softmax temperature parameter, control the sharpness of the weight distribution
+            
+        Returns:
+            sample_weights: sample-level weights [B]
+        """
+        # compute average negative log probability for each sample (log ppl）
+        masked_neg_logprobs = -teacher_rollout_logprobs * token_mask  # [B, S-1]
+        
+        # compute valid token count for each sample
+        valid_token_count = token_mask.sum(dim=1)  # [B]
+        valid_token_count = torch.clamp(valid_token_count, min=1e-8)  # avoid division by zero
+        
+        # compute average negative log probability for each sample
+        sample_avg_neg_logprob = masked_neg_logprobs.sum(dim=1) / valid_token_count  # [B]
+        
+        # only compute softmax for valid samples, set invalid sample weights to 0
+        masked_scores = torch.where(
+            sample_mask.bool(),
+            sample_avg_neg_logprob / temperature,
+            torch.full_like(sample_avg_neg_logprob, -1e9)  # set invalid sample to small value
+        )
+        
+        # compute softmax weights
+        softmax_weights = torch.softmax(masked_scores, dim=0)  # [B]
+        
+        # ensure invalid sample weights are 0
+        sample_weights = softmax_weights * sample_mask
+        
+        # re-normalize to valid sample count
+        valid_sample_count = sample_mask.sum()
+        valid_sample_count = torch.clamp(valid_sample_count, min=1e-8)
+        
+        # re-normalize to valid sample count
+        sample_weights = sample_weights * valid_sample_count
+        
+        # apply clamp
+        sample_weights = torch.clamp(
+            sample_weights,
+            min=self.adaptive_weight_min_clamp,
+            max=self.adaptive_weight_max_clamp
+        )
+        
+        # apply sample_mask again
+        sample_weights = sample_weights * sample_mask
+        
+        return sample_weights
