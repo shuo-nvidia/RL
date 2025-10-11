@@ -1055,7 +1055,6 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
         grad_input = torch.cat(grads, dim=1) if len(grads) > 1 else grads[0]
         return grad_input, None, None, None
 
-
 class ChunkedDistributedTopkLogits(torch.autograd.Function):
     """Distributed version: Compute top-k logits and probabilities with chunking over sequence.
 

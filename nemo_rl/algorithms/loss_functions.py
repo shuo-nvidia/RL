@@ -25,12 +25,12 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
-    ChunkedDistributedTopkLogits,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs,
     gather_logits_at_global_indices,
     get_logprobs_from_vocab_parallel_logits,
+    ChunkedDistributedTopkLogits
 )
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
@@ -833,12 +833,14 @@ class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
-    align_correlation: bool
     token_level_correlation: bool
-    sample_level_correlation: bool  # whether to enable sample level weighting based on teacher PPL
-    adaptive_weight_min_clamp: float  # minimum value limit for weights
-    adaptive_weight_max_clamp: float  # maximum value limit for weights
-    smooth_correction: bool  # whether to use smooth correction for alignment correction term
+    sample_level_correlation: bool
+    adaptive_weight_min_clamp: float
+    adaptive_weight_max_clamp: float
+    smooth_correction: bool
+    teacher_eos_token_id: int | None
+    student_eos_token_id: int | None
+
 
 class DistillationLossDataDict(TypedDict):
     input_ids: torch.Tensor
@@ -847,7 +849,6 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
-    teacher_rollout_logprobs: NotRequired[torch.Tensor]  # teacher's logprobs on student's rollout path, for PPL calculation
 
 
 class DistillationLossFn(LossFunction):
@@ -856,14 +857,14 @@ class DistillationLossFn(LossFunction):
     def __init__(self, cfg: DistillationLossConfig):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
-        self.zero_outside_topk = cfg["zero_outside_topk"]
-        self.align_correlation = cfg.get("align_correlation", True)
+        self.zero_outside_topk = cfg.get("zero_outside_topk", True)
         self.token_level_correlation = cfg.get("token_level_correlation", True)
         self.sample_level_correlation = cfg.get("sample_level_correlation", True)
         self.adaptive_weight_min_clamp = cfg.get("adaptive_weight_min_clamp", 0.2)
         self.adaptive_weight_max_clamp = cfg.get("adaptive_weight_max_clamp", 5.0)
         self.smooth_correction = cfg.get("smooth_correction", True)
-        self.log_infinitesimal = -100
+        self.teacher_eos_token_id = cfg.get("teacher_eos_token_id", None)
+        self.student_eos_token_id = cfg.get("student_eos_token_id", None)
         self.loss_type = LossType.TOKEN_LEVEL
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
@@ -896,6 +897,16 @@ class DistillationLossFn(LossFunction):
         # Preferred truncated-KL path: teacher provides top-k support per position
         teacher_topk_logits = data["teacher_topk_logits"]  # [B, S, k]
         teacher_topk_indices = data["teacher_topk_indices"]  # [B, S, k]
+
+        # EOS token ID correction: replace teacher EOS with student EOS if they differ
+        if (self.teacher_eos_token_id is not None and 
+            self.student_eos_token_id is not None and 
+            self.teacher_eos_token_id != self.student_eos_token_id):
+            teacher_topk_indices = torch.where(
+                teacher_topk_indices == self.teacher_eos_token_id,
+                torch.tensor(self.student_eos_token_id, dtype=teacher_topk_indices.dtype, device=teacher_topk_indices.device),
+                teacher_topk_indices
+            )
 
         if teacher_topk_indices.shape[-1] <= 0:
             raise ValueError(
@@ -981,18 +992,17 @@ class DistillationLossFn(LossFunction):
 
 
         # Compute alignment correction term if enabled
-        align_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
-        student_not_in_teacher_count = None
-        if self.align_correlation:
-            align_correction_term, student_not_in_teacher_count = self._compute_align_correction(
-                logits_tensor,  
-                teacher_topk_indices, 
-                parallel_group,
-                cp_group,
-                cp_size,
-                None,  
-            )
-        
+        #if self.zero_outside_topk:
+        align_correction_term, student_not_in_teacher_count = self._compute_align_correction(
+            logits_tensor,  
+            teacher_topk_indices, 
+            parallel_group,
+            cp_group,
+            cp_size,
+            None,  
+        )
+        if not self.zero_outside_topk:
+            align_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
 
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
@@ -1040,7 +1050,6 @@ class DistillationLossFn(LossFunction):
             "teacher_rollout_logprobs" in data and 
             "token_mask" in data and 
             "sample_mask" in data):
-            
             teacher_rollout_logprobs = data["teacher_rollout_logprobs"][:, 1:]  # remove the first token
             token_mask_for_ppl = data["token_mask"][:, 1:]
             sample_mask_for_ppl = data["sample_mask"]
