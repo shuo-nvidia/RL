@@ -1,6 +1,6 @@
 # Distillation Algorithm Configuration
 distillation:
-    num_prompts_per_step: 128
+    num_prompts_per_step: 64
     num_generations_per_prompt: 1
     max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
     max_num_steps: 1000
@@ -12,9 +12,14 @@ distillation:
     seed: 42
 
 loss_fn:
-    kl_type: "mixed" # forward, reverse, mixed
+    kl_type: "reverse" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
-    zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
+    zero_outside_topk: false # zero out the teacher logits which are inside the student top k and outside the teacher top k when calculate forward KL loss
+    smooth_correction: true # whether to use smooth correction for alignment correction term
+    sample_level_correlation: false # whether to enable sample level weighting based on teacher PPL
+    token_level_correlation: false # whether to enable token level weighting based on student not in teacher count
+    teacher_eos_token_id: 151645 # Qwen3-32B uses <|im_end|> as EOS
+    student_eos_token_id: 151643 # Qwen3-4B-Base uses <|endoftext|> as EOS
 
 checkpointing:
     enabled: true
@@ -22,30 +27,30 @@ checkpointing:
     metric_name: "val_reward"
     higher_is_better: true
     keep_top_k: 3
-    save_period: 10
-    checkpoint_must_save_by: null
+    save_period: 5
+    checkpoint_must_save_by: "0:1:50:00"
     model_save_format: "safetensors"
     save_consolidated: false
 
 policy: &POLICY_BASE
-    model_name: "Qwen/Qwen3-1.7B-Base"
+    model_name: "Qwen/Qwen3-4B-Base"
     tokenizer:
         name: ${..model_name} ## specify if you'd like to use a tokenizer different from the model's default
     train_global_batch_size: 64
-    train_micro_batch_size: 1
+    train_micro_batch_size: 2
     generation_batch_size: 64
-    logprob_batch_size: 1
-    max_total_sequence_length: 8192
+    logprob_batch_size: 2
+    max_total_sequence_length: 32768
     precision: "bfloat16"
     logprob_chunk_size: null
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
-        _v2: true
+        _v2: false
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
-        tensor_parallel_size: 2
+        tensor_parallel_size: 8
         context_parallel_size: 2
         custom_parallel_plan: null
 
@@ -70,7 +75,7 @@ policy: &POLICY_BASE
     optimizer:
         name: "torch.optim.AdamW"
         kwargs:
-            lr: 2.0e-5
+            lr: 5.0e-5
             weight_decay: 0.01
             betas: [0.9, 0.999]
             eps: 1e-8
@@ -100,15 +105,16 @@ policy: &POLICY_BASE
         temperature: 1.0
         top_p: 1.0
         top_k: null
-        stop_token_ids: null
+        stop_token_ids: [151645,151643]
         stop_strings: null
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
             tensor_parallel_size: 1
             pipeline_parallel_size: 1
+            enable_expert_parallel: false
             expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
-            gpu_memory_utilization: 0.6
+            gpu_memory_utilization: 0.7
             max_model_len: ${...max_total_sequence_length} # refer to local policy/teacher config
             enforce_eager: False
             use_deep_gemm: False
@@ -128,11 +134,13 @@ policy: &POLICY_BASE
 
 teacher:
     <<: *POLICY_BASE
-    model_name: "Qwen/Qwen3-4B"
+    model_name: "Qwen/Qwen3-32B"
     dtensor_cfg:
         <<: *DTENSOR_BASE
-        context_parallel_size: 2 
-        tensor_parallel_size: 4
+        context_parallel_size: 2
+        tensor_parallel_size: 8
+    # generation_batch_size: 64
+    # max_total_sequence_length: 8192
 
 data:
     max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
@@ -151,11 +159,11 @@ logger:
     wandb_enabled: true
     tensorboard_enabled: true
     mlflow_enabled: false
-    swanlab_enabled: false
+    swanlab_enabled: false # Disable SwanLab logging
     monitor_gpus: true
     wandb:
         project: "nemo-distillation"
-        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        name: "distillation-${data.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}-${loss_fn.zero_outside_topk}"
     tensorboard:
         log_dir: "tb_logs-distillation-${data.dataset_name}"
     mlflow:
@@ -167,4 +175,4 @@ logger:
 
 cluster:
     gpus_per_node: 8
-    num_nodes: 1
+    num_nodes: 4

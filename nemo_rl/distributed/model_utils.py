@@ -1054,3 +1054,156 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
 
         grad_input = torch.cat(grads, dim=1) if len(grads) > 1 else grads[0]
         return grad_input, None, None, None
+
+class ChunkedDistributedTopkLogits(torch.autograd.Function):
+    """Distributed version: Compute top-k logits and probabilities with chunking over sequence.
+
+    Forward returns top-k indices and probabilities; backward propagates through logits.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        vocab_parallel_logits: torch.Tensor,  # [B, S, V_local]
+        chunk_size: int,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        k: int,
+        inference_only: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, S, V_local = vocab_parallel_logits.shape
+        num_chunks = (S + chunk_size - 1) // chunk_size
+
+        # Get vocabulary range for this TP rank
+        vocab_start_index = 0
+        vocab_end_index = V_local
+        if tp_group is not None:
+            tp_rank = torch.distributed.get_rank(tp_group)
+            vocab_start_index = tp_rank * V_local
+            vocab_end_index = (tp_rank + 1) * V_local
+
+        indices_chunks: list[torch.Tensor] = []
+        probs_chunks: list[torch.Tensor] = []
+
+        for chunk_idx in range(num_chunks):
+            s0 = chunk_idx * chunk_size
+            s1 = min(S, (chunk_idx + 1) * chunk_size)
+            logits_chunk = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
+
+            # Get distributed top-k
+            topk_vals, topk_indices = distributed_vocab_topk(
+                logits_chunk, 
+                k=k, 
+                tp_group=tp_group,
+                vocab_start_index=vocab_start_index,
+                vocab_end_index=vocab_end_index
+            )
+
+            # Convert raw logits to probabilities using distributed softmax
+            log_probs = _compute_distributed_log_softmax(logits_chunk, group=tp_group)
+            
+            # Get the log probabilities at top-k positions
+            B_chunk, S_chunk, _ = topk_indices.shape
+            batch_idx = torch.arange(B_chunk, device=topk_indices.device).view(-1, 1, 1)
+            seq_idx = torch.arange(S_chunk, device=topk_indices.device).view(1, -1, 1)
+            
+            # Convert global indices to local indices for this TP rank
+            local_indices = torch.clamp(topk_indices - vocab_start_index, 0, V_local - 1)
+            
+            # Only gather probabilities for indices that belong to this TP rank
+            in_range_mask = (topk_indices >= vocab_start_index) & (topk_indices < vocab_end_index)
+            
+            # Initialize with very small log probabilities (avoid extreme values that cause numerical issues)
+            topk_log_probs = torch.full_like(topk_vals, -50.0, dtype=torch.float32)
+            
+            # Fill in the actual log probabilities for indices in this TP rank
+            valid_positions = in_range_mask
+            if valid_positions.any():
+                topk_log_probs[valid_positions] = log_probs[
+                    batch_idx.expand_as(topk_indices)[valid_positions],
+                    seq_idx.expand_as(topk_indices)[valid_positions],
+                    local_indices[valid_positions]
+                ]
+            
+            # Convert to probabilities
+            topk_probs = topk_log_probs.exp()
+
+            indices_chunks.append(topk_indices)
+            probs_chunks.append(topk_probs)
+
+        # Concatenate results
+        topk_indices_all = torch.cat(indices_chunks, dim=1)
+        topk_probs_all = torch.cat(probs_chunks, dim=1)
+
+        if not inference_only:
+            ctx.save_for_backward(vocab_parallel_logits, topk_indices_all)
+            ctx.chunk_size = chunk_size
+            ctx.tp_group = tp_group
+            ctx.k = k
+            ctx.vocab_start_index = vocab_start_index
+            ctx.vocab_end_index = vocab_end_index
+
+        return topk_indices_all.contiguous(), topk_probs_all.contiguous()
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        grad_indices, grad_probs = grad_outputs  # [B, S, k], [B, S, k]
+        vocab_parallel_logits, topk_indices = ctx.saved_tensors
+        chunk_size = ctx.chunk_size
+        tp_group = ctx.tp_group
+        k = ctx.k
+        vocab_start_index = ctx.vocab_start_index
+        vocab_end_index = ctx.vocab_end_index
+        orig_dtype = vocab_parallel_logits.dtype  # save original dtype
+
+        B, S, V_local = vocab_parallel_logits.shape
+        num_chunks = (S + chunk_size - 1) // chunk_size
+        grads: list[torch.Tensor] = []
+
+        for chunk_idx in range(num_chunks):
+            s0 = chunk_idx * chunk_size
+            s1 = min(S, (chunk_idx + 1) * chunk_size)
+            chunk_len = s1 - s0
+
+            # extract current chunk data
+            logits = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
+            log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
+            softmax_output = log_probs.exp()  # [B, chunk_len, V_local]
+            chunk_indices = topk_indices[:, s0:s1, :]  # [B, chunk_len, k]
+            chunk_grad_probs = grad_probs[:, s0:s1, :].to(torch.float32)  # [B, chunk_len, k]
+
+            # filter current rank's Top-k and convert indices
+            in_range_mask = (chunk_indices >= vocab_start_index) & (chunk_indices < vocab_end_index)  # [B, chunk_len, k]
+            local_indices = torch.clamp(chunk_indices - vocab_start_index, 0, V_local - 1)  # [B, chunk_len, k]
+
+            # key: calculate global sum(grad_prob * softmax_prob) 
+            # get softmax values for current rank Top-k
+            B_chunk = B
+            batch_idx = torch.arange(B_chunk, device=softmax_output.device).view(-1, 1, 1)
+            seq_idx = torch.arange(chunk_len, device=softmax_output.device).view(1, -1, 1)
+            topk_softmax_vals = softmax_output[batch_idx, seq_idx, local_indices]  # [B, chunk_len, k]
+            
+            # calculate local "gradient × probability" (only current rank's Top-k contribution)
+            local_gp = chunk_grad_probs * topk_softmax_vals * in_range_mask.float()  # [B, chunk_len, k]
+            # cross TP group
+            global_sum_gp = local_gp.sum(dim=-1, keepdim=True)  # [B, chunk_len, 1]
+            if tp_group is not None:
+                torch.distributed.all_reduce(global_sum_gp, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+
+            # full gradient formula: p * (g_p - global_sum_gp)
+            grad_contributions = topk_softmax_vals * (chunk_grad_probs - global_sum_gp.expand_as(chunk_grad_probs))
+            grad_contributions = grad_contributions * in_range_mask.float()  # only keep gradients for current rank
+
+            # vectorized scatter gradient
+            grad_chunk = torch.zeros_like(softmax_output)
+            batch_indices = batch_idx.expand(B_chunk, chunk_len, k)
+            seq_indices = seq_idx.expand(B_chunk, chunk_len, k)
+            grad_chunk[batch_indices, seq_indices, local_indices] += grad_contributions
+
+            # transform back to original dtype
+            grad_chunk = grad_chunk.to(orig_dtype)
+            grads.append(grad_chunk)
+
+        grad_input = torch.cat(grads, dim=1)
+        return grad_input.contiguous(), None, None, None, None
