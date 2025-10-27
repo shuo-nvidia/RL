@@ -993,7 +993,7 @@ class DistillationLossFn(LossFunction):
 
         # Compute alignment correction term if enabled
         #if self.zero_outside_topk:
-        align_correction_term, student_not_in_teacher_count = self._compute_align_correction(
+        align_correction_term, student_not_in_teacher_count, prob_in_teacher_topk_sum, prob_not_in_teacher_topk_sum = self._compute_align_correction(
             logits_tensor,  
             teacher_topk_indices, 
             parallel_group,
@@ -1035,8 +1035,14 @@ class DistillationLossFn(LossFunction):
             
             # 直接使用已经计算好的student_topk_logits来计算熵
 
-            adaptive_weights = self._compute_token_level_adaptive_weights(
-                student_topk_logprobs.exp(),  # 传入概率而非logits，形状[B, S-1, k]
+            # adaptive_weights, mean_ent_bacth_level, max_entropy_ratio, min_entropy_ratio = self._compute_token_level_adaptive_weights(
+            #     student_topk_logprobs.exp(),  # 传入概率而非logits，形状[B, S-1, k]
+            #     token_mask=token_mask_for_weights,
+            # )
+
+            # Trick 2 Ablation 2: use teacher's topk probs to compute adaptive weights
+            adaptive_weights, mean_ent_bacth_level, max_entropy_ratio, min_entropy_ratio = self._compute_token_level_adaptive_weights(
+                teacher_probs,  # 传入概率而非logits，形状[B, S-1, k]
                 token_mask=token_mask_for_weights,
             )
             
@@ -1098,14 +1104,39 @@ class DistillationLossFn(LossFunction):
                 mask_for_metric,
                 global_normalization_factor=global_valid_toks
             )
+            mean_correction_term = masked_mean(
+                align_correction_term,
+                mask_for_metric,
+                global_normalization_factor=global_valid_toks
+            )
+            mean_prob_in_teacher_topk = masked_mean(
+                prob_in_teacher_topk_sum,
+                mask_for_metric,
+                global_normalization_factor=global_valid_toks
+            )
+            mean_prob_not_in_teacher_topk = masked_mean(
+                prob_not_in_teacher_topk_sum,
+                mask_for_metric,
+                global_normalization_factor=global_valid_toks
+            )
         else:
             student_not_in_teacher_per_token = student_not_in_teacher_count.mean()
-
+            mean_correction_term = align_correction_term.mean()
+            mean_prob_in_teacher_topk = prob_in_teacher_topk_sum.mean()
+            mean_prob_not_in_teacher_topk = prob_not_in_teacher_topk_sum.mean()
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "num_valid_samples": int(batch_size),
             "student_not_in_teacher_per_token": float(student_not_in_teacher_per_token.item()),
+            "trick/mean_correction_term": float(mean_correction_term.item()),
+            "trick/mean_prob_in_teacher_topk": float(mean_prob_in_teacher_topk.item()),
+            "trick/mean_prob_not_in_teacher_topk": float(mean_prob_not_in_teacher_topk.item()),
         }
+
+        if self.token_level_correlation:
+            metrics["trick/mean_ent_bacth_level"] = float(mean_ent_bacth_level.item())
+            metrics["trick/max_entropy_ratio"] = float(max_entropy_ratio.item())
+            metrics["trick/min_entropy_ratio"] = float(min_entropy_ratio.item())
 
         return kl_loss, metrics
 
@@ -1214,19 +1245,20 @@ class DistillationLossFn(LossFunction):
         
         # compute sum of probabilities of tokens not in teacher topk
         correction_probs = student_topk_probs * not_in_teacher.float()  # [B, S-1, k]
-        align_correction_term = correction_probs.sum(dim=-1)  # [B, S-1]
+        prob_not_in_teacher_topk_sum = correction_probs.sum(dim=-1)  # [B, S-1]
+        prob_in_teacher_topk_sum = 1 - prob_not_in_teacher_topk_sum
         
         # compute number of tokens in student topk that are not in teacher topk
         student_not_in_teacher_count = not_in_teacher.sum(dim=-1).float()  # [B, S-1]
         
         if self.smooth_correction:
-            align_correction_term = 2 * torch.pow(align_correction_term, 3) - torch.pow(align_correction_term, 4)
+            align_correction_term = 2 * torch.pow(prob_not_in_teacher_topk_sum, 3) - torch.pow(prob_not_in_teacher_topk_sum, 4)
         else:
             eps = 1e-8  # avoid log(0)
-            x = torch.clamp(align_correction_term, min=eps)
+            x = torch.clamp(prob_not_in_teacher_topk_sum, min=eps)
             align_correction_term = -x * torch.log(x) + align_correction_term
         
-        return align_correction_term, student_not_in_teacher_count
+        return align_correction_term, student_not_in_teacher_count, prob_in_teacher_topk_sum, prob_not_in_teacher_topk_sum
     
     def _compute_token_level_adaptive_weights(
         self,
@@ -1281,6 +1313,20 @@ class DistillationLossFn(LossFunction):
         # 用当前token的熵除以平均熵，得到相对熵比值
         # 比值>1表示该token比平均更不确定，比值<1表示比平均更确定
         entropy_ratio = entropy / mean_entropy  # [B, S-1]
+
+        mean_ent_bacth_level = mean_entropy.mean()  # [B, 1] -> [1]
+        # 仅在有效token上计算全局最大/最小比值
+        valid_mask = token_mask > 0.5
+        if valid_mask.any():
+            max_entropy_ratio = entropy_ratio[valid_mask].max()
+            min_entropy_ratio = entropy_ratio[valid_mask].min()
+        else:
+            # 若整个batch都无有效token，设为安全默认值
+            max_entropy_ratio = torch.tensor(0.0, device=entropy_ratio.device, dtype=entropy_ratio.dtype)
+            min_entropy_ratio = torch.tensor(0.0, device=entropy_ratio.device, dtype=entropy_ratio.dtype)
+
+        # 给不确定的token分配更高的权重
+        # entropy_ratio = mean_entropy / entropy
         
         # 应用clamp，避免极端权重，并确保pad位置权重为0
         adaptive_weights = torch.clamp(
@@ -1289,7 +1335,7 @@ class DistillationLossFn(LossFunction):
             max=self.adaptive_weight_max_clamp
         ) * token_mask  # [B, S-1]
         
-        return adaptive_weights
+        return adaptive_weights, mean_ent_bacth_level, max_entropy_ratio, min_entropy_ratio
     
     def _compute_sample_level_weights(
         self,

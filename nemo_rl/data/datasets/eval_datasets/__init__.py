@@ -18,8 +18,8 @@ from nemo_rl.data.datasets.eval_datasets.local_math_dataset import LocalMathData
 from nemo_rl.data.datasets.eval_datasets.math import MathDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu import MMLUDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu_pro import MMLUProDataset
-
-
+from nemo_rl.data.datasets.eval_datasets.amc import AMCDataset
+from nemo_rl.data.datasets.eval_datasets.minerva import MinervaDataset
 def load_eval_dataset(data_config):
     """Loads evaluation dataset."""
     dataset_name = data_config["dataset_name"]
@@ -79,6 +79,18 @@ def load_eval_dataset(data_config):
     elif dataset_name == "math500":
         base_dataset = MathDataset(
             variant="math_500_test",
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
+    # amc
+    elif dataset_name == "amc23":
+        base_dataset = AMCDataset(
+            prompt_file=data_config["prompt_file"],
+            system_prompt_file=data_config["system_prompt_file"],
+        )
+    # minerva
+    elif dataset_name == "minerva-math":
+        base_dataset = MinervaDataset(
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
