@@ -15,6 +15,7 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
 import torch.distributed
+import math
 
 from nemo_rl.algorithms.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.utils import (
@@ -860,8 +861,8 @@ class DistillationLossFn(LossFunction):
         self.zero_outside_topk = cfg.get("zero_outside_topk", True)
         self.token_level_correlation = cfg.get("token_level_correlation", False)
         self.sample_level_correlation = cfg.get("sample_level_correlation", False)
-        self.adaptive_weight_min_clamp = cfg.get("adaptive_weight_min_clamp", 0.8)
-        self.adaptive_weight_max_clamp = cfg.get("adaptive_weight_max_clamp", 1.2)   # 这里我把token和sample级别权重设置成了同一组裁剪系数方便实验，实际上后期精细化调参时候应该有所区分
+        self.adaptive_weight_min_clamp = cfg.get("adaptive_weight_min_clamp", 0.5)
+        self.adaptive_weight_max_clamp = cfg.get("adaptive_weight_max_clamp", 1.5)   # 这里我把token和sample级别权重设置成了同一组裁剪系数方便实验，实际上后期精细化调参时候应该有所区分
         self.smooth_correction = cfg.get("smooth_correction", True)
         self.teacher_eos_token_id = cfg.get("teacher_eos_token_id", None)
         self.student_eos_token_id = cfg.get("student_eos_token_id", None)
@@ -989,21 +990,10 @@ class DistillationLossFn(LossFunction):
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
-
-
-        # Compute alignment correction term if enabled
-        #if self.zero_outside_topk:
-        align_correction_term, student_not_in_teacher_count, prob_in_teacher_topk_sum, prob_not_in_teacher_topk_sum = self._compute_align_correction(
-            logits_tensor,  
-            teacher_topk_indices, 
-            parallel_group,
-            cp_group,
-            cp_size,
-            None,  
-        )
-        if not self.zero_outside_topk:
-            align_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
-
+        # ===== Baseline KL Term =====
+        # 按照 teacher 选择 topk indices，计算 teacher 的 topk logprobs 和 student 的 topk logprobs 之间的 KL 损失
+        # 在topk内部进行softmax
+        # ===== Baseline KL Term =====
         if self.kl_type == "forward":
             per_token_kl = teacher_probs * (
                 teacher_topk_logprobs - student_topk_logprobs
@@ -1021,9 +1011,28 @@ class DistillationLossFn(LossFunction):
                 + (1.0 - self.mixed_kl_weight) * kl_reverse
             )
 
-        per_token_kl = per_token_kl.sum(dim=-1) + align_correction_term  # [B, S-1]
+        # Separate KL term and alignment correction term to allow decoupled weighting
+        kl_term = per_token_kl.sum(dim=-1)  # [B, S-1]
+
+        # ===== Trick 1: Alignment Correction =====
+        # - 按照 student 自己的 probs进行 topk 进行选择
+        # - 然后计算 student 的 topk 中不在 teacher 的 topk 中的 tokens 的概率之和
+        # - 进而计算出一个纠正项，用于修正 KL 损失
+        # ===== Trick 1: Alignment Correction =====
+        align_correction_term, student_not_in_teacher_count, prob_in_teacher_topk_sum, prob_not_in_teacher_topk_sum = self._compute_align_correction(
+            logits_tensor,  
+            teacher_topk_indices, 
+            parallel_group,
+            cp_group,
+            cp_size,
+            None,  
+        )
+        if not self.zero_outside_topk:
+            align_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
         
-        # Apply adaptive weighting based on alignment if enabled
+        # ===== Trick 2: Token Level Adaptive Weights =====
+        # 不同的 token 的权重不同，用来 scale KL 损失
+        # ===== Trick 2: Token Level Adaptive Weights =====
         if self.token_level_correlation:
             # get token mask for correct handling of pad positions
             token_mask_for_weights = None
@@ -1040,15 +1049,20 @@ class DistillationLossFn(LossFunction):
             #     token_mask=token_mask_for_weights,
             # )
 
-            # Trick 2 Ablation 2: use teacher's topk probs to compute adaptive weights
-            adaptive_weights, mean_ent_bacth_level, max_entropy_ratio, min_entropy_ratio = self._compute_token_level_adaptive_weights(
+            # Ablation 2: use teacher's topk probs to compute adaptive weights
+            adaptive_weights, mean_h_bacth_level, max_conf_bacth_level, min_conf_bacth_level, mean_conf_bacth_level = self._compute_token_level_adaptive_weights(
                 teacher_probs,  # 传入概率而非logits，形状[B, S-1, k]
                 token_mask=token_mask_for_weights,
             )
             
-            per_token_kl = per_token_kl * adaptive_weights
+            # Apply token-level weights ONLY to the KL term
+            kl_term = kl_term * adaptive_weights
 
-        # Apply sample-level weighting based on GSPO-style ratio if enabled
+        per_token_kl = kl_term + align_correction_term * 0.5
+
+        # ===== Trick 3: Sample Level Adaptive Weights =====
+        # Apply sample-level weighting based on GSPO-style ratio
+        # ===== Trick 3: Sample Level Adaptive Weights =====
         sample_level_weights = None
         if (self.sample_level_correlation and 
             "teacher_rollout_logprobs" in data and 
@@ -1061,7 +1075,7 @@ class DistillationLossFn(LossFunction):
             teacher_rollout_logprobs = teacher_rollout_logprobs[:, :max_len]
             student_rollout_logprobs = student_rollout_logprobs[:, :max_len]
             
-            sample_level_weights = self._compute_sample_level_weights(
+            sample_level_weights, mean_ratio_weights, max_ratio_weights, min_ratio_weights = self._compute_sample_level_weights(
                 data["teacher_rollout_logprobs"][:, 1:],
                 data["student_rollout_logprobs"][:, 1:],
                 data["token_mask"][:, 1:max_len],
@@ -1099,12 +1113,12 @@ class DistillationLossFn(LossFunction):
             sample_mask_for_metric = data["sample_mask"]
             mask_for_metric = token_mask_for_metric * sample_mask_for_metric.unsqueeze(-1)
             
-            student_not_in_teacher_per_token = masked_mean(
+            mean_student_not_in_teacher_per_token = masked_mean(
                 student_not_in_teacher_count,
                 mask_for_metric,
                 global_normalization_factor=global_valid_toks
             )
-            mean_correction_term = masked_mean(
+            mean_align_correction_term = masked_mean(
                 align_correction_term,
                 mask_for_metric,
                 global_normalization_factor=global_valid_toks
@@ -1120,42 +1134,53 @@ class DistillationLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks
             )
         else:
-            student_not_in_teacher_per_token = student_not_in_teacher_count.mean()
-            mean_correction_term = align_correction_term.mean()
+            mean_student_not_in_teacher_per_token = student_not_in_teacher_count.mean()
+            mean_align_correction_term = align_correction_term.mean()
             mean_prob_in_teacher_topk = prob_in_teacher_topk_sum.mean()
             mean_prob_not_in_teacher_topk = prob_not_in_teacher_topk_sum.mean()
+
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "num_valid_samples": int(batch_size),
-            "student_not_in_teacher_per_token": float(student_not_in_teacher_per_token.item()),
-            "trick/mean_correction_term": float(mean_correction_term.item()),
-            "trick/mean_prob_in_teacher_topk": float(mean_prob_in_teacher_topk.item()),
-            "trick/mean_prob_not_in_teacher_topk": float(mean_prob_not_in_teacher_topk.item()),
+            "trick1/mean_student_not_in_teacher_per_token": float(mean_student_not_in_teacher_per_token.item()),
+            "trick1/mean_align_correction_term": float(mean_align_correction_term.item()),
+            "trick1/mean_prob_in_teacher_topk": float(mean_prob_in_teacher_topk.item()),
+            "trick1/mean_prob_not_in_teacher_topk": float(mean_prob_not_in_teacher_topk.item()),
         }
 
         if self.token_level_correlation:
-            metrics["trick/mean_ent_bacth_level"] = float(mean_ent_bacth_level.item())
-            metrics["trick/max_entropy_ratio"] = float(max_entropy_ratio.item())
-            metrics["trick/min_entropy_ratio"] = float(min_entropy_ratio.item())
+            metrics["trick2/mean_h_bacth_level"] = float(mean_h_bacth_level.item())
+            metrics["trick2/max_conf_bacth_level"] = float(max_conf_bacth_level.item())
+            metrics["trick2/min_conf_bacth_level"] = float(min_conf_bacth_level.item())
+            metrics["trick2/mean_conf_bacth_level"] = float(mean_conf_bacth_level.item())
+
+        if self.sample_level_correlation:
+            metrics["trick3/mean_sample_weights"] = float(mean_ratio_weights.item())
+            metrics["trick3/max_sample_weights"] = float(max_ratio_weights.item())
+            metrics["trick3/min_sample_weights"] = float(min_ratio_weights.item())
 
         return kl_loss, metrics
 
     def _compute_align_correction(
         self,
-        student_logits: torch.Tensor,  # [B, S-1, V_local]
-        teacher_topk_indices: torch.Tensor,  # [B, S-1, k]
+        student_logits: torch.Tensor,  # [B, S, V_local]
+        teacher_topk_indices: torch.Tensor,  # [B, S, k]
         parallel_group: Optional[torch.distributed.ProcessGroup],
         cp_group: Optional[torch.distributed.ProcessGroup],
         cp_size: int,
         chunk_size: Optional[int],
     ) -> torch.Tensor:
         """
+        Trick 1: Alignment Correction
+        - 按照 student 自己的 probs进行 topk 进行选择
+        - 然后计算 student 的 topk 中不在 teacher 的 topk 中的 tokens 的概率之和
+
         Compute alignment correction term: student does global softmax and topk,
         select the tokens in student topk that are not in teacher topk, and compute the sum of probabilities of these tokens in student global softmax.
         
         Args:
-            student_logits: Student model's logits [B, S-1, V_local]
-            teacher_topk_indices: Teacher's top-k indices [B, S-1, k]
+            student_logits: Student model's logits [B, S, V_local]
+            teacher_topk_indices: Teacher's top-k indices [B, S, k]
             parallel_group: Tensor parallel group
             cp_group: Context parallel group
             cp_size: Context parallel size
@@ -1167,7 +1192,7 @@ class DistillationLossFn(LossFunction):
             student_not_in_teacher_count: Number of tokens in student topk that are not in teacher topk [B, S-1]
         """
 
-        B, S_minus_1, V_local = student_logits.shape
+        B, S, V_local = student_logits.shape
         k_teacher = teacher_topk_indices.shape[-1]
         
         # use the same k value for student's topk calculation
@@ -1175,7 +1200,7 @@ class DistillationLossFn(LossFunction):
         
         if parallel_group is not None:
             # Distributed case: use ChunkedDistributedTopkLogits
-            chunk_size = max(1, min(S_minus_1, 1024)) if chunk_size is None else chunk_size
+            chunk_size = max(1, min(S, 1024)) if chunk_size is None else chunk_size
             
             # Process context parallel
             pad_len = 0
@@ -1230,8 +1255,6 @@ class DistillationLossFn(LossFunction):
         student_topk_probs = student_topk_probs[:, :-1, :]
 
         # find tokens in student topk that are not in teacher topk
-        # student_topk_indices: [B, S-1, k], teacher_topk_indices: [B, S-1, k]
-        
         # expand dimensions for comparison
         student_indices_expanded = student_topk_indices.unsqueeze(-1)  # [B, S-1, k, 1]
         teacher_indices_expanded = teacher_topk_indices.unsqueeze(-2)  # [B, S-1, 1, k]
@@ -1256,7 +1279,7 @@ class DistillationLossFn(LossFunction):
         else:
             eps = 1e-8  # avoid log(0)
             x = torch.clamp(prob_not_in_teacher_topk_sum, min=eps)
-            align_correction_term = -x * torch.log(x) + align_correction_term
+            align_correction_term = -x * torch.log(x)
         
         return align_correction_term, student_not_in_teacher_count, prob_in_teacher_topk_sum, prob_not_in_teacher_topk_sum
     
@@ -1266,20 +1289,21 @@ class DistillationLossFn(LossFunction):
         token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        计算基于student top-k熵的自适应权重。
-        
-        使用相对熵比值：当前token的熵除以该序列所有有效token的平均熵。
-        比值>1表示该token比序列平均更不确定，比值<1表示比平均更确定。
+        使用归一化熵（基于传入的 top-k 概率）构造有界且稳定的置信度权重：
+        conf = 1 - H/H_max，其中 H = -∑ p log p，H_max = log(k)。
         
         Args:
-            student_topk_probs: student的top-k概率分布 [B, S-1, k]，已经是概率形式
+            student_topk_probs: top-k 概率分布 [B, S-1, k]（可为 teacher 或 student 的概率，内部会再规范化）
             token_mask: token有效性mask [B, S-1]
             
         Returns:
-            adaptive_weights: 自适应权重 [B, S-1]，值为熵比值经过clamp后的结果
+            adaptive_weights: 自适应权重 [B, S-1]（序列内均值=1，clamp后，detach）
+            mean_ent_bacth_level: batch 级别的平均归一化熵（标量）
+            max_entropy_ratio: 这里复用为 conf 的最大值（标量）
+            min_entropy_ratio: 这里复用为 conf 的最小值（标量）
         """
         B, S_minus_1, student_k = student_topk_probs.shape
-        
+
         # 如果没有提供mask，创建全1的mask
         if token_mask is None:
             token_mask = torch.ones(B, S_minus_1, device=student_topk_probs.device)
@@ -1287,55 +1311,52 @@ class DistillationLossFn(LossFunction):
             # 确保token_mask的序列长度与student_topk_probs匹配
             if token_mask.shape[1] != S_minus_1:
                 raise ValueError(f"token_mask length mismatch: {token_mask.shape[1]} != {S_minus_1}")
-        
-        # 对top-k概率进行归一化，确保它们在top-k范围内和为1，方便熵计算
-        topk_probs_normalized = student_topk_probs / (student_topk_probs.sum(dim=-1, keepdim=True) + 1e-10)  # [B, S-1, k]
-        
-        # 计算每个token位置上top-k分布的熵
-        # 熵: H = -sum(p * log(p))
-        entropy = -torch.sum(
-            topk_probs_normalized * torch.log(topk_probs_normalized + 1e-10), 
-            dim=-1
-        )  # [B, S-1]
-        
-        # 计算每个序列中有效token的平均熵
-        # 先将无效token位置的熵设为0
-        masked_entropy = entropy * token_mask  # [B, S-1]
-        
-        # 计算有效token数量
-        valid_token_count = token_mask.sum(dim=1, keepdim=True)  # [B, 1]
-        valid_token_count = torch.clamp(valid_token_count, min=1.0)
-        
-        # 计算平均熵
-        mean_entropy = masked_entropy.sum(dim=1, keepdim=True) / valid_token_count  # [B, 1]
-        mean_entropy = torch.clamp(mean_entropy, min=1e-10)  # 避免除零
-        
-        # 用当前token的熵除以平均熵，得到相对熵比值
-        # 比值>1表示该token比平均更不确定，比值<1表示比平均更确定
-        entropy_ratio = entropy / mean_entropy  # [B, S-1]
 
-        mean_ent_bacth_level = mean_entropy.mean()  # [B, 1] -> [1]
-        # 仅在有效token上计算全局最大/最小比值
+        # 规范化 top-k 概率（稳健处理输入不是严格归一化的情况）
+        probs_normalized = student_topk_probs / (student_topk_probs.sum(dim=-1, keepdim=True) + 1e-10)  # [B, S-1, k]
+
+        # 计算每个token位置上top-k分布的熵 H
+        entropy = -torch.sum(
+            probs_normalized * torch.log(probs_normalized + 1e-12),
+            dim=-1,
+        )  # [B, S-1]
+
+        # 归一化熵 h ∈ [0,1]，以及置信度 conf = 1 - h ∈ [0,1]
+        H_max = math.log(max(1, student_k)) if student_k > 0 else 1.0
+        if H_max <= 0:
+            H_max = 1.0
+        h = (entropy / H_max).clamp(0.0, 1.0)
+        conf = 1.0 - h  # teacher越自信（分布越尖锐），conf越大
+
+        # 将无效位置置零
+        conf = conf * token_mask
+
+        # 计算 batch 级别指标（保持原有返回签名，但语义更新）
+        # 使用归一化熵 h 的 batch 均值，范围 [0,1]
+        valid_token_count = token_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        mean_h_per_seq = (entropy * token_mask).sum(dim=1, keepdim=True) / valid_token_count  # [B,1]
+        mean_h_bacth_level = mean_h_per_seq.mean()  # 标量
+        mean_conf_per_seq = conf.sum(dim=1, keepdim=True) / valid_token_count  # 标量
+        mean_conf_bacth_level = mean_conf_per_seq.mean()  # 标量
+
         valid_mask = token_mask > 0.5
         if valid_mask.any():
-            max_entropy_ratio = entropy_ratio[valid_mask].max()
-            min_entropy_ratio = entropy_ratio[valid_mask].min()
+            max_conf_bacth_level = conf[valid_mask].max()
+            min_conf_bacth_level = conf[valid_mask].min()
         else:
-            # 若整个batch都无有效token，设为安全默认值
-            max_entropy_ratio = torch.tensor(0.0, device=entropy_ratio.device, dtype=entropy_ratio.dtype)
-            min_entropy_ratio = torch.tensor(0.0, device=entropy_ratio.device, dtype=entropy_ratio.dtype)
+            max_conf_bacth_level = torch.tensor(0.0, device=conf.device, dtype=conf.dtype)
+            min_conf_bacth_level = torch.tensor(0.0, device=conf.device, dtype=conf.dtype)
 
-        # 给不确定的token分配更高的权重
-        # entropy_ratio = mean_entropy / entropy
-        
-        # 应用clamp，避免极端权重，并确保pad位置权重为0
+        # clamp + 序列内均值归一化（均值=1），保持学习率稳定
         adaptive_weights = torch.clamp(
-            entropy_ratio, 
-            min=self.adaptive_weight_min_clamp, 
-            max=self.adaptive_weight_max_clamp
-        ) * token_mask  # [B, S-1]
-        
-        return adaptive_weights, mean_ent_bacth_level, max_entropy_ratio, min_entropy_ratio
+            conf,
+            min=self.adaptive_weight_min_clamp,
+            max=self.adaptive_weight_max_clamp,
+        )
+        # 避免权重反传引入不稳定
+        adaptive_weights = adaptive_weights.detach()
+
+        return adaptive_weights, mean_h_bacth_level, max_conf_bacth_level, min_conf_bacth_level, mean_conf_bacth_level
     
     def _compute_sample_level_weights(
         self,
@@ -1381,6 +1402,10 @@ class DistillationLossFn(LossFunction):
         
         # 转换为实际比值：exp(log_ratio) = (pi_student / pi_teacher)^(1/y)
         ratio_weights = torch.exp(log_ratio_normalized)  # [B]
+
+        mean_ratio_weights = ratio_weights.mean()
+        max_ratio_weights = ratio_weights.max()
+        min_ratio_weights = ratio_weights.min()
         
         # 应用clamp限制极端权重，并确保无效样本权重为0
         sample_weights = torch.clamp(
@@ -1389,4 +1414,4 @@ class DistillationLossFn(LossFunction):
             max=self.adaptive_weight_max_clamp
         ) * sample_mask  # [B]
         
-        return sample_weights
+        return sample_weights, mean_ratio_weights, max_ratio_weights, min_ratio_weights

@@ -1,7 +1,8 @@
 defaults: distillation_math.yaml
 
 distillation:
-    num_prompts_per_step: 128
+    num_prompts_per_step: 512
+    num_generations_per_prompt: 4
     max_num_steps: 1000
     val_batch_size: 512
     val_period: 20
@@ -22,24 +23,24 @@ checkpointing:
 
 policy:
     model_name: "Qwen/Qwen3-1.7B-Base"
+    max_total_sequence_length: 20480
     tokenizer:
         name: "Qwen/Qwen3-1.7B-Base" ## specify if you'd like to use a tokenizer different from the model's default
-    train_global_batch_size: 128
-    generation_batch_size: 128
+    train_global_batch_size: 2048
 
     dtensor_cfg:
-        tensor_parallel_size: 8
-        context_parallel_size: 2
+        tensor_parallel_size: 4
+        context_parallel_size: 1
 
     optimizer:
         kwargs:
             lr: 2.0e-5
 
 teacher:
-    model_name: "Qwen/Qwen3-32B"
+    model_name: "Qwen/Qwen3-4B-Thinking-2507"
     dtensor_cfg:
-        tensor_parallel_size: 8
-        context_parallel_size: 2
+        tensor_parallel_size: 4
+        context_parallel_size: 1
 
 logger:
     wandb:

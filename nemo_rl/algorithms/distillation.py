@@ -643,14 +643,21 @@ def distillation_train(
                     if master_config["distillation"].get("sample_level_correlation", False):
                         teacher_rollout_logprobs = teacher_policy.get_logprobs(train_data)
                         train_data["teacher_rollout_logprobs"] = teacher_rollout_logprobs["logprobs"]
-                        
-                        # Also get student rollout logprobs for GSPO-style weighting
-                        student_rollout_logprobs = student_policy.get_logprobs(train_data)
-                        train_data["student_rollout_logprobs"] = student_rollout_logprobs["logprobs"]
 
-                print("▶ Preparing for training...")
-                with timer.time("training_prep"):
+                print("▶ Preparing for student logprob inference...")
+                with timer.time("student_logprob_inference_prep"):
                     teacher_policy.offload_after_refit()
+                    # student_policy.prepare_for_training()  # set model train and reload optim to GPU
+                    student_policy.prepare_for_lp_inference()
+                    # POLICY_GENERATION_STALE = True
+
+                print("▶ Computing student rollout logprobs...")
+                with timer.time("student_rollout_logprob_inference"):
+                    student_rollout_logprobs = student_policy.get_logprobs(train_data)
+                    train_data["student_rollout_logprobs"] = student_rollout_logprobs["logprobs"]
+
+                print("▶ Preparing for training...", flush=True)
+                with timer.time("training_prep"):
                     student_policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
@@ -758,18 +765,32 @@ def distillation_train(
                 "mean_prompt_length": repeated_batch["length"].numpy(),
                 "total_num_tokens": input_lengths.numpy(),
             }
+            trick_metrics = {}
             metrics.update(train_results["all_mb_metrics"])
             for k, v in metrics.items():
-                if k in {
-                    "lr",
-                    "wd",
-                    "global_valid_seqs",
-                    "global_valid_toks",
-                    "mean_prompt_length",
-                }:
-                    metrics[k] = np.mean(v).item()
+                if "trick" in k:
+                    if "mean_" in k:
+                        trick_metrics[k] = np.mean(v).item()
+                    elif "max_" in k:
+                        trick_metrics[k] = np.max(v).item()
+                    elif "min_" in k:
+                        trick_metrics[k] = np.min(v).item()
+                    else:
+                        trick_metrics[k] = np.sum(v).item()
                 else:
-                    metrics[k] = np.sum(v).item()
+                    if k in {
+                        "lr",
+                        "wd",
+                        "global_valid_seqs",
+                        "global_valid_toks",
+                        "mean_prompt_length",
+                    }:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+            # remove trick metrics from main metrics
+            for k in trick_metrics.keys():
+                del metrics[k]
             metrics.update(rollout_metrics)
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
@@ -827,6 +848,7 @@ def distillation_train(
 
             logger.log_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            logger.log_metrics(trick_metrics, step + 1)
 
             timer.reset()
             step += 1
