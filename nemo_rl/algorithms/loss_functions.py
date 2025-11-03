@@ -850,6 +850,8 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    teacher_rollout_logprobs: Optional[torch.Tensor]
+    student_rollout_logprobs: Optional[torch.Tensor]
 
 
 class DistillationLossFn(LossFunction):
@@ -1050,7 +1052,7 @@ class DistillationLossFn(LossFunction):
             # )
 
             # Ablation 2: use teacher's topk probs to compute adaptive weights
-            adaptive_weights, mean_h_bacth_level, max_conf_bacth_level, min_conf_bacth_level, mean_conf_bacth_level = self._compute_token_level_adaptive_weights(
+            adaptive_weights, entropy, conf, max_conf_batch_level, min_conf_batch_level = self._compute_token_level_adaptive_weights(
                 teacher_probs,  # 传入概率而非logits，形状[B, S-1, k]
                 token_mask=token_mask_for_weights,
             )
@@ -1064,80 +1066,66 @@ class DistillationLossFn(LossFunction):
         # Apply sample-level weighting based on GSPO-style ratio
         # ===== Trick 3: Sample Level Adaptive Weights =====
         sample_level_weights = None
-        if (self.sample_level_correlation and 
-            "teacher_rollout_logprobs" in data and 
-            "student_rollout_logprobs" in data and
-            "token_mask" in data and 
-            "sample_mask" in data):
-            
+        if self.sample_level_correlation:
             # ensure length consistent
             max_len = per_token_kl.shape[1]
-            teacher_rollout_logprobs = teacher_rollout_logprobs[:, :max_len]
-            student_rollout_logprobs = student_rollout_logprobs[:, :max_len]
-            
+            teacher_rollout_logprobs = data["teacher_rollout_logprobs"][:, 1:max_len]
+            student_rollout_logprobs = data["student_rollout_logprobs"][:, 1:max_len]
+            token_mask_for_sample = data["token_mask"][:, 1:max_len]
+
             sample_level_weights, mean_ratio_weights, max_ratio_weights, min_ratio_weights = self._compute_sample_level_weights(
-                data["teacher_rollout_logprobs"][:, 1:],
-                data["student_rollout_logprobs"][:, 1:],
-                data["token_mask"][:, 1:max_len],
+                teacher_rollout_logprobs,
+                student_rollout_logprobs,
+                token_mask_for_sample,
                 data["sample_mask"],
             )
 
         # masking and reduction
-        if "token_mask" in data and "sample_mask" in data:
-            token_mask = data["token_mask"][:, 1:]
-            sample_mask = data["sample_mask"]
-            # align mask length to current per_token_kl
-            max_len = per_token_kl.shape[1]
-            token_mask = token_mask[:, :max_len]
-            mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
-            
-            # if sample level weights are provided, apply to mask
-            if sample_level_weights:
-                mask = mask * sample_level_weights.unsqueeze(-1)  # [B, S-1]
-            
-            # align mask shape to per_token_kl
-            kl_loss = masked_mean(
-                per_token_kl,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            )
-        else:
-            kl_loss = per_token_kl.mean()
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        # align mask length to current per_token_kl
+        max_len = per_token_kl.shape[1]
+        token_mask = token_mask[:, :max_len]
+        mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+        
+        # if sample level weights are provided, apply to mask
+        if sample_level_weights is not None:
+            mask = mask * sample_level_weights.unsqueeze(-1)  # [B, S-1]
+        
+        # align mask shape to per_token_kl
+        kl_loss = masked_mean(
+            per_token_kl,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
 
-        # compute average of student not in teacher per token
-        if "token_mask" in data and "sample_mask" in data:
-            # use the same mask to compute average
-            max_len = student_not_in_teacher_count.shape[1]
-            token_mask_for_metric = data["token_mask"][:, 1:]  # remove the first token, match [B, S-1]
+        # use the same mask to compute average
+        max_len = student_not_in_teacher_count.shape[1]
+        token_mask_for_metric = data["token_mask"][:, 1:]  # remove the first token, match [B, S-1]
 
-            sample_mask_for_metric = data["sample_mask"]
-            mask_for_metric = token_mask_for_metric * sample_mask_for_metric.unsqueeze(-1)
-            
-            mean_student_not_in_teacher_per_token = masked_mean(
-                student_not_in_teacher_count,
-                mask_for_metric,
-                global_normalization_factor=global_valid_toks
-            )
-            mean_align_correction_term = masked_mean(
-                align_correction_term,
-                mask_for_metric,
-                global_normalization_factor=global_valid_toks
-            )
-            mean_prob_in_teacher_topk = masked_mean(
-                prob_in_teacher_topk_sum,
-                mask_for_metric,
-                global_normalization_factor=global_valid_toks
-            )
-            mean_prob_not_in_teacher_topk = masked_mean(
-                prob_not_in_teacher_topk_sum,
-                mask_for_metric,
-                global_normalization_factor=global_valid_toks
-            )
-        else:
-            mean_student_not_in_teacher_per_token = student_not_in_teacher_count.mean()
-            mean_align_correction_term = align_correction_term.mean()
-            mean_prob_in_teacher_topk = prob_in_teacher_topk_sum.mean()
-            mean_prob_not_in_teacher_topk = prob_not_in_teacher_topk_sum.mean()
+        sample_mask_for_metric = data["sample_mask"]
+        mask_for_metric = token_mask_for_metric * sample_mask_for_metric.unsqueeze(-1)
+        
+        mean_student_not_in_teacher_per_token = masked_mean(
+            student_not_in_teacher_count,
+            mask_for_metric,
+            global_normalization_factor=global_valid_toks
+        )
+        mean_align_correction_term = masked_mean(
+            align_correction_term,
+            mask_for_metric,
+            global_normalization_factor=global_valid_toks
+        )
+        mean_prob_in_teacher_topk = masked_mean(
+            prob_in_teacher_topk_sum,
+            mask_for_metric,
+            global_normalization_factor=global_valid_toks
+        )
+        mean_prob_not_in_teacher_topk = masked_mean(
+            prob_not_in_teacher_topk_sum,
+            mask_for_metric,
+            global_normalization_factor=global_valid_toks
+        )
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
@@ -1149,15 +1137,25 @@ class DistillationLossFn(LossFunction):
         }
 
         if self.token_level_correlation:
-            metrics["trick2/mean_h_bacth_level"] = float(mean_h_bacth_level.item())
-            metrics["trick2/max_conf_bacth_level"] = float(max_conf_bacth_level.item())
-            metrics["trick2/min_conf_bacth_level"] = float(min_conf_bacth_level.item())
-            metrics["trick2/mean_conf_bacth_level"] = float(mean_conf_bacth_level.item())
+            mean_h_per_token = masked_mean(
+                entropy,
+                mask_for_metric,
+                global_normalization_factor=global_valid_toks
+            )
+            mean_conf_per_token = masked_mean(
+                conf,
+                mask_for_metric,
+                global_normalization_factor=global_valid_toks
+            )
+            metrics["trick2/mean_h_per_token"] = float(mean_h_per_token.item())
+            metrics["trick2/max_conf_batch_level"] = float(max_conf_batch_level.item())
+            metrics["trick2/min_conf_batch_level"] = float(min_conf_batch_level.item())
+            metrics["trick2/mean_conf_per_token"] = float(mean_conf_per_token.item())
 
         if self.sample_level_correlation:
-            metrics["trick3/mean_sample_weights"] = float(mean_ratio_weights.item())
-            metrics["trick3/max_sample_weights"] = float(max_ratio_weights.item())
-            metrics["trick3/min_sample_weights"] = float(min_ratio_weights.item())
+            metrics["trick3/mean_sample_weight"] = float(mean_ratio_weights.item())
+            metrics["trick3/max_sample_weight"] = float(max_ratio_weights.item())
+            metrics["trick3/min_sample_weight"] = float(min_ratio_weights.item())
 
         return kl_loss, metrics
 
@@ -1269,7 +1267,8 @@ class DistillationLossFn(LossFunction):
         # compute sum of probabilities of tokens not in teacher topk
         correction_probs = student_topk_probs * not_in_teacher.float()  # [B, S-1, k]
         prob_not_in_teacher_topk_sum = correction_probs.sum(dim=-1)  # [B, S-1]
-        prob_in_teacher_topk_sum = 1 - prob_not_in_teacher_topk_sum
+        prob_in_teacher_topk_sum = student_topk_probs * is_in_teacher.float()
+        prob_in_teacher_topk_sum = prob_in_teacher_topk_sum.sum(dim=-1)  # [B, S-1]
         
         # compute number of tokens in student topk that are not in teacher topk
         student_not_in_teacher_count = not_in_teacher.sum(dim=-1).float()  # [B, S-1]
@@ -1331,14 +1330,6 @@ class DistillationLossFn(LossFunction):
         # 将无效位置置零
         conf = conf * token_mask
 
-        # 计算 batch 级别指标（保持原有返回签名，但语义更新）
-        # 使用归一化熵 h 的 batch 均值，范围 [0,1]
-        valid_token_count = token_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-        mean_h_per_seq = (entropy * token_mask).sum(dim=1, keepdim=True) / valid_token_count  # [B,1]
-        mean_h_bacth_level = mean_h_per_seq.mean()  # 标量
-        mean_conf_per_seq = conf.sum(dim=1, keepdim=True) / valid_token_count  # 标量
-        mean_conf_bacth_level = mean_conf_per_seq.mean()  # 标量
-
         valid_mask = token_mask > 0.5
         if valid_mask.any():
             max_conf_bacth_level = conf[valid_mask].max()
@@ -1356,7 +1347,7 @@ class DistillationLossFn(LossFunction):
         # 避免权重反传引入不稳定
         adaptive_weights = adaptive_weights.detach()
 
-        return adaptive_weights, mean_h_bacth_level, max_conf_bacth_level, min_conf_bacth_level, mean_conf_bacth_level
+        return adaptive_weights, entropy, conf, max_conf_bacth_level, min_conf_bacth_level
     
     def _compute_sample_level_weights(
         self,

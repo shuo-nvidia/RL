@@ -14,6 +14,7 @@
 
 import argparse
 import os
+import pprint
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -143,6 +144,10 @@ def main() -> None:
 
     # Get the next experiment directory with incremented ID
     config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
+
+    # Print config
+    print("Final config:")
+    pprint.pprint(config)
 
     init_ray()
 

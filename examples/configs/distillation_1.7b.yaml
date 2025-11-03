@@ -2,7 +2,7 @@ defaults: distillation_math.yaml
 
 distillation:
     num_prompts_per_step: 512
-    num_generations_per_prompt: 4
+    num_generations_per_prompt: 1
     max_num_steps: 1000
     val_batch_size: 512
     val_period: 20
@@ -26,7 +26,7 @@ policy:
     max_total_sequence_length: 20480
     tokenizer:
         name: "Qwen/Qwen3-1.7B-Base" ## specify if you'd like to use a tokenizer different from the model's default
-    train_global_batch_size: 2048
+    train_global_batch_size: 512
 
     dtensor_cfg:
         tensor_parallel_size: 4

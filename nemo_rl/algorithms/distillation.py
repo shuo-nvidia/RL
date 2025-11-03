@@ -640,7 +640,8 @@ def distillation_train(
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
 
-                    if master_config["distillation"].get("sample_level_correlation", False):
+                    if master_config["loss_fn"]["sample_level_correlation"]:
+                        print("▶ Computing teacher rollout logprobs...")
                         teacher_rollout_logprobs = teacher_policy.get_logprobs(train_data)
                         train_data["teacher_rollout_logprobs"] = teacher_rollout_logprobs["logprobs"]
 
@@ -769,7 +770,7 @@ def distillation_train(
             metrics.update(train_results["all_mb_metrics"])
             for k, v in metrics.items():
                 if "trick" in k:
-                    if "mean_" in k:
+                    if "mean_sample_weight" in k:
                         trick_metrics[k] = np.mean(v).item()
                     elif "max_" in k:
                         trick_metrics[k] = np.max(v).item()
